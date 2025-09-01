@@ -15,5 +15,5 @@ const (
 	QueueInboundSize           = 1024
 	QueueHandshakeSize         = 1024
 	MaxSegmentSize             = (1 << 16) - 1 // largest possible UDP datagram
-	PreallocatedBuffersPerPool = 8192
+	PreallocatedBuffersPerPool = 4096
 )
