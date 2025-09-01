@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
 package device
@@ -24,10 +24,10 @@ func TestCurveWrappers(t *testing.T) {
 	pk1 := sk1.publicKey()
 	pk2 := sk2.publicKey()
 
-	ss1 := sk1.sharedSecret(pk2)
-	ss2 := sk2.sharedSecret(pk1)
+	ss1, err1 := sk1.sharedSecret(pk2)
+	ss2, err2 := sk2.sharedSecret(pk1)
 
-	if ss1 != ss2 {
+	if ss1 != ss2 || err1 != nil || err2 != nil {
 		t.Fatal("Failed to compute shared secet")
 	}
 }
@@ -148,7 +148,7 @@ func TestNoiseHandshake(t *testing.T) {
 		t.Fatal("failed to derive keypair for peer 2", err)
 	}
 
-	key1 := peer1.keypairs.loadNext()
+	key1 := peer1.keypairs.next.Load()
 	key2 := peer2.keypairs.current
 
 	// encrypting / decryption test

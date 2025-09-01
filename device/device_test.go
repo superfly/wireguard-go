@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2021 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
  */
 
 package device
@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/rand"
 	"net/netip"
+	"os"
 	"runtime"
 	"runtime/pprof"
 	"sync"
@@ -21,6 +22,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/conn/bindtest"
+	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 )
 
@@ -307,6 +309,17 @@ func TestConcurrencySafety(t *testing.T) {
 		}
 	})
 
+	// Perform bind updates and keepalive sends concurrently with tunnel use.
+	t.Run("bindUpdate and keepalive", func(t *testing.T) {
+		const iters = 10
+		for i := 0; i < iters; i++ {
+			for _, peer := range pair {
+				peer.dev.BindUpdate()
+				peer.dev.SendKeepalivesToPeersWithCurrentKeypair()
+			}
+		}
+	})
+
 	close(done)
 }
 
@@ -333,7 +346,7 @@ func BenchmarkThroughput(b *testing.B) {
 
 	// Measure how long it takes to receive b.N packets,
 	// starting when we receive the first packet.
-	var recv uint64
+	var recv atomic.Uint64
 	var elapsed time.Duration
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -342,7 +355,7 @@ func BenchmarkThroughput(b *testing.B) {
 		var start time.Time
 		for {
 			<-pair[0].tun.Inbound
-			new := atomic.AddUint64(&recv, 1)
+			new := recv.Add(1)
 			if new == 1 {
 				start = time.Now()
 			}
@@ -358,7 +371,7 @@ func BenchmarkThroughput(b *testing.B) {
 	ping := tuntest.Ping(pair[0].ip, pair[1].ip)
 	pingc := pair[1].tun.Outbound
 	var sent uint64
-	for atomic.LoadUint64(&recv) != uint64(b.N) {
+	for recv.Load() != uint64(b.N) {
 		sent++
 		pingc <- ping
 	}
@@ -404,4 +417,60 @@ func goroutineLeakCheck(t *testing.T) {
 		t.Logf("ending stacks:\n%s\n", endStacks)
 		t.Fatalf("expected %d goroutines, got %d, leak?", startGoroutines, endGoroutines)
 	})
+}
+
+type fakeBindSized struct {
+	size int
+}
+
+func (b *fakeBindSized) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+	return nil, 0, nil
+}
+func (b *fakeBindSized) Close() error                                  { return nil }
+func (b *fakeBindSized) SetMark(mark uint32) error                     { return nil }
+func (b *fakeBindSized) Send(bufs [][]byte, ep conn.Endpoint) error    { return nil }
+func (b *fakeBindSized) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
+func (b *fakeBindSized) BatchSize() int                                { return b.size }
+
+type fakeTUNDeviceSized struct {
+	size int
+}
+
+func (t *fakeTUNDeviceSized) File() *os.File { return nil }
+func (t *fakeTUNDeviceSized) Read(bufs [][]byte, sizes []int, offset int) (n int, err error) {
+	return 0, nil
+}
+func (t *fakeTUNDeviceSized) Write(bufs [][]byte, offset int) (int, error) { return 0, nil }
+func (t *fakeTUNDeviceSized) MTU() (int, error)                            { return 0, nil }
+func (t *fakeTUNDeviceSized) Name() (string, error)                        { return "", nil }
+func (t *fakeTUNDeviceSized) Events() <-chan tun.Event                     { return nil }
+func (t *fakeTUNDeviceSized) Close() error                                 { return nil }
+func (t *fakeTUNDeviceSized) BatchSize() int                               { return t.size }
+
+func TestBatchSize(t *testing.T) {
+	d := Device{}
+
+	d.net.bind = &fakeBindSized{1}
+	d.tun.device = &fakeTUNDeviceSized{1}
+	if want, got := 1, d.BatchSize(); got != want {
+		t.Errorf("expected batch size %d, got %d", want, got)
+	}
+
+	d.net.bind = &fakeBindSized{1}
+	d.tun.device = &fakeTUNDeviceSized{128}
+	if want, got := 128, d.BatchSize(); got != want {
+		t.Errorf("expected batch size %d, got %d", want, got)
+	}
+
+	d.net.bind = &fakeBindSized{128}
+	d.tun.device = &fakeTUNDeviceSized{1}
+	if want, got := 128, d.BatchSize(); got != want {
+		t.Errorf("expected batch size %d, got %d", want, got)
+	}
+
+	d.net.bind = &fakeBindSized{128}
+	d.tun.device = &fakeTUNDeviceSized{128}
+	if want, got := 128, d.BatchSize(); got != want {
+		t.Errorf("expected batch size %d, got %d", want, got)
+	}
 }
