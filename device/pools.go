@@ -7,6 +7,8 @@ package device
 
 import (
 	"sync"
+
+	"golang.zx2c4.com/wireguard/conn"
 )
 
 type WaitPool struct {
@@ -46,24 +48,32 @@ func (p *WaitPool) Put(x any) {
 	p.cond.Signal()
 }
 
-func (device *Device) PopulatePools() {
-	device.pool.inboundElementsContainer = NewWaitPool(PreallocatedBuffersPerPool, func() any {
-		s := make([]*QueueInboundElement, 0, device.BatchSize())
+var (
+	sharedInboundElementsContainerPool = NewWaitPool(PreallocatedBuffersPerPool, func() any {
+		s := make([]*QueueInboundElement, 0, conn.IdealBatchSize)
 		return &QueueInboundElementsContainer{elems: s}
 	})
-	device.pool.outboundElementsContainer = NewWaitPool(PreallocatedBuffersPerPool, func() any {
-		s := make([]*QueueOutboundElement, 0, device.BatchSize())
+	sharedOutboundElementsContainerPool = NewWaitPool(PreallocatedBuffersPerPool, func() any {
+		s := make([]*QueueOutboundElement, 0, conn.IdealBatchSize)
 		return &QueueOutboundElementsContainer{elems: s}
 	})
-	device.pool.messageBuffers = NewWaitPool(PreallocatedBuffersPerPool, func() any {
+	sharedMessageBuffersPool = NewWaitPool(PreallocatedBuffersPerPool, func() any {
 		return new([MaxMessageSize]byte)
 	})
-	device.pool.inboundElements = NewWaitPool(PreallocatedBuffersPerPool, func() any {
+	sharedInboundElementsPool = NewWaitPool(PreallocatedBuffersPerPool, func() any {
 		return new(QueueInboundElement)
 	})
-	device.pool.outboundElements = NewWaitPool(PreallocatedBuffersPerPool, func() any {
+	sharedOutboundElementsPool = NewWaitPool(PreallocatedBuffersPerPool, func() any {
 		return new(QueueOutboundElement)
 	})
+)
+
+func (device *Device) PopulatePools() {
+	device.pool.inboundElementsContainer = sharedInboundElementsContainerPool
+	device.pool.outboundElementsContainer = sharedOutboundElementsContainerPool
+	device.pool.messageBuffers = sharedMessageBuffersPool
+	device.pool.inboundElements = sharedInboundElementsPool
+	device.pool.outboundElements = sharedOutboundElementsPool
 }
 
 func (device *Device) GetInboundElementsContainer() *QueueInboundElementsContainer {
