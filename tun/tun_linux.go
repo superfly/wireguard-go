@@ -655,14 +655,6 @@ func handleVirtioTnlRead(in []byte, tnl virtioNetHdrTnl, bufs [][]byte, sizes []
 	if l.outerUdpAt < l.outerIphLen || l.outerUdpAt+udphLen > len(in) {
 		return 0, fmt.Errorf("virtioNetHdr.outerThOffset (%d) is out of bounds", tnl.outerThOffset)
 	}
-	if l.outerUdpAt != l.outerIphLen && l.outerUdpAt-tunTunnelOuterThBias == l.outerIphLen {
-		// The bound the kernel enforces on this field counts an Ethernet
-		// header that IFF_TUN never delivers, so a header written for it
-		// carries the bias tunTunnelOuterThBias describes. Undo it here; the
-		// position the outer UDP header actually sits at is the one the IP
-		// header's own length implies.
-		l.outerUdpAt -= tunTunnelOuterThBias
-	}
 
 	// Inner IP header, which the kernel points us at too.
 	l.innerIphAt = int(tnl.innerNhOffset)

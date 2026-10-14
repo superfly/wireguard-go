@@ -191,6 +191,27 @@ func tnlHdrScratch(n int) [][]byte {
 	return hdrs
 }
 
+// asReadByKernel reports a header slot the way the kernel reports one when it
+// hands us a packet. We pad outerThOffset on write, because the bound the
+// kernel validates it against counts an Ethernet header that IFF_TUN does not
+// deliver, but tun_vnet_hdr_from_skb reports the field unbiased. A header we
+// emitted therefore has to lose the pad before the split, which models the
+// kernel, is given it.
+func asReadByKernel(hdr []byte) []byte {
+	out := append([]byte{}, hdr...)
+	var h virtioNetHdrTnl
+	if err := h.decode(out); err != nil {
+		return out
+	}
+	if h.gsoType&virtioNetHdrGSOUDPTunnel != 0 {
+		h.outerThOffset -= tunTunnelOuterThBias
+		if err := h.encode(out); err != nil {
+			return out
+		}
+	}
+	return out
+}
+
 // runTnlGRO hands pkts to handleGRO and returns the indices it chose to write.
 func runTnlGRO(t *testing.T, pkts [][]byte) ([][]byte, [][]byte, []int, *tunnelGROTable) {
 	t.Helper()
@@ -235,7 +256,7 @@ func Test_tunnelGRO_roundTrip(t *testing.T) {
 						}
 						const offset = 16
 						in := make([]byte, 0, virtioNetHdrTnlLen+len(bufs[toWrite[0]])-offset)
-						in = append(in, hdrs[toWrite[0]]...)
+						in = append(in, asReadByKernel(hdrs[toWrite[0]])...)
 						in = append(in, bufs[toWrite[0]][offset:]...)
 
 						outBufs := make([][]byte, segs)
@@ -465,7 +486,7 @@ func Test_tunnelGRO_outOfOrder(t *testing.T) {
 	const offset = 16
 	total := 0
 	for _, i := range toWrite {
-		in := append(append([]byte{}, hdrs[i]...), bufs[i][offset:]...)
+		in := append(append([]byte{}, asReadByKernel(hdrs[i])...), bufs[i][offset:]...)
 		outBufs := [][]byte{make([]byte, 65535), make([]byte, 65535), make([]byte, 65535)}
 		sizes := make([]int, 3)
 		n, err := handleVirtioRead(in, outBufs, sizes, 0, virtioNetHdrTnlLen)
@@ -569,7 +590,7 @@ func Fuzz_tunnelGRO(f *testing.F) {
 				t.Fatalf("duplicate toWrite index %d", i)
 			}
 			seen[i] = true
-			in := append(append([]byte{}, hdrs[i]...), bufs[i][offset:]...)
+			in := append(append([]byte{}, asReadByKernel(hdrs[i])...), bufs[i][offset:]...)
 			n, err := handleVirtioRead(in, outBufs, sizes, 0, virtioNetHdrTnlLen)
 			if err != nil && !errors.Is(err, ErrTooManySegments) {
 				t.Fatalf("handleVirtioRead rejected what handleGRO produced: %v\nhdr %x\npkt %x", err, hdrs[i], bufs[i][offset:])
