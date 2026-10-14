@@ -6,12 +6,14 @@
 package tun
 
 import (
+	"errors"
 	"net/netip"
 	"testing"
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	gvisorchecksum "gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
@@ -240,7 +242,7 @@ func Test_handleVirtioRead(t *testing.T) {
 				out[i] = make([]byte, 65535)
 			}
 			tt.hdr.encode(tt.pktIn)
-			n, err := handleVirtioRead(tt.pktIn, out, sizes, offset)
+			n, err := handleVirtioRead(tt.pktIn, out, sizes, offset, virtioNetHdrLen)
 			if err != nil {
 				if tt.wantErr {
 					return
@@ -290,7 +292,7 @@ func Fuzz_handleGRO(f *testing.F) {
 	f.Fuzz(func(t *testing.T, pkt0, pkt1, pkt2, pkt3, pkt4, pkt5, pkt6, pkt7, pkt8, pkt9, pkt10, pkt11 []byte, canUDPGRO bool, offset int) {
 		pkts := [][]byte{pkt0, pkt1, pkt2, pkt3, pkt4, pkt5, pkt6, pkt7, pkt8, pkt9, pkt10, pkt11}
 		toWrite := make([]int, 0, len(pkts))
-		handleGRO(pkts, offset, newTCPGROTable(), newUDPGROTable(), canUDPGRO, &toWrite)
+		handleGRO(pkts, offset, newTCPGROTable(), newUDPGROTable(), nil, canUDPGRO, nil, &toWrite)
 		if len(toWrite) > len(pkts) {
 			t.Errorf("len(toWrite): %d > len(pkts): %d", len(toWrite), len(pkts))
 		}
@@ -507,7 +509,7 @@ func Test_handleGRO(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			toWrite := make([]int, 0, len(tt.pktsIn))
-			err := handleGRO(tt.pktsIn, offset, newTCPGROTable(), newUDPGROTable(), tt.canUDPGRO, &toWrite)
+			err := handleGRO(tt.pktsIn, offset, newTCPGROTable(), newUDPGROTable(), nil, tt.canUDPGRO, nil, &toWrite)
 			if err != nil {
 				if tt.wantErr {
 					return
@@ -644,7 +646,7 @@ func Test_packetIsGROCandidate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := packetIsGROCandidate(tt.b, tt.canUDPGRO); got != tt.want {
+			if got := packetIsGROCandidate(tt.b, tt.canUDPGRO, false); got != tt.want {
 				t.Errorf("packetIsGROCandidate() = %v, want %v", got, tt.want)
 			}
 		})
@@ -764,7 +766,7 @@ func Test_handleGRO_invalidItemCsumClearsVirtioNetHdr(t *testing.T) {
 
 	table := newTCPGROTable()
 	toWrite := make([]int, 0, len(pkts))
-	if err := handleGRO(pkts, virtioNetHdrLen, table, newUDPGROTable(), false, &toWrite); err != nil {
+	if err := handleGRO(pkts, virtioNetHdrLen, table, newUDPGROTable(), nil, false, nil, &toWrite); err != nil {
 		t.Fatal(err)
 	}
 
@@ -797,4 +799,155 @@ func Test_handleGRO_invalidItemCsumClearsVirtioNetHdr(t *testing.T) {
 			t.Fatalf("pkts[0] virtioNetHdr[%d] = 0x%x, want 0", i, b)
 		}
 	}
+}
+
+// Test_handleVirtioRead_content checks the segments that come out of a plain,
+// unencapsulated GSO packet in detail, rather than merely checking their sizes.
+func Test_handleVirtioRead_content(t *testing.T) {
+	const gsoSize = 100
+	tests := []struct {
+		name    string
+		hdr     virtioNetHdr
+		pktIn   []byte
+		segs    int
+		isV6    bool
+		iphLen  int
+		tcp     bool
+		baseID  uint16
+		baseSeq uint32
+	}{
+		{
+			"tcp4",
+			virtioNetHdr{flags: unix.VIRTIO_NET_HDR_F_NEEDS_CSUM, gsoType: unix.VIRTIO_NET_HDR_GSO_TCPV4, gsoSize: gsoSize, hdrLen: 40, csumStart: 20, csumOffset: 16},
+			tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck|header.TCPFlagPsh, 2*gsoSize, 1),
+			2, false, ipv4HeaderLen, true, 0, 1,
+		},
+		{
+			"tcp6",
+			virtioNetHdr{flags: unix.VIRTIO_NET_HDR_F_NEEDS_CSUM, gsoType: unix.VIRTIO_NET_HDR_GSO_TCPV6, gsoSize: gsoSize, hdrLen: 60, csumStart: 40, csumOffset: 16},
+			tcp6Packet(ip6PortA, ip6PortB, header.TCPFlagAck|header.TCPFlagPsh, 2*gsoSize, 1),
+			2, true, ipv6HeaderLen, true, 0, 1,
+		},
+		{
+			"udp4",
+			virtioNetHdr{flags: unix.VIRTIO_NET_HDR_F_NEEDS_CSUM, gsoType: unix.VIRTIO_NET_HDR_GSO_UDP_L4, gsoSize: gsoSize, hdrLen: 28, csumStart: 20, csumOffset: 6},
+			udp4Packet(ip4PortA, ip4PortB, 2*gsoSize),
+			2, false, ipv4HeaderLen, false, 0, 0,
+		},
+		{
+			"udp6",
+			virtioNetHdr{flags: unix.VIRTIO_NET_HDR_F_NEEDS_CSUM, gsoType: unix.VIRTIO_NET_HDR_GSO_UDP_L4, gsoSize: gsoSize, hdrLen: 48, csumStart: 40, csumOffset: 6},
+			udp6Packet(ip6PortA, ip6PortB, 2*gsoSize),
+			2, true, ipv6HeaderLen, false, 0, 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.hdr.encode(tt.pktIn)
+			out := make([][]byte, conn.IdealBatchSize)
+			sizes := make([]int, conn.IdealBatchSize)
+			for i := range out {
+				out[i] = make([]byte, 65535)
+			}
+			n, err := handleVirtioRead(tt.pktIn, out, sizes, offset, virtioNetHdrLen)
+			if err != nil {
+				t.Fatalf("got err: %v", err)
+			}
+			if n != tt.segs {
+				t.Fatalf("got %d packets, want %d", n, tt.segs)
+			}
+			for i := range n {
+				// The segment carries its own copy of the headers, so parse
+				// them from the segment rather than from the template.
+				ipv4H := header.IPv4(out[i][offset:])
+				ipv6H := header.IPv6(out[i][offset:])
+				seg := out[i][offset : offset+sizes[i]]
+				proto := uint8(unix.IPPROTO_UDP)
+				transportLen := udphLen
+				if tt.tcp {
+					proto = unix.IPPROTO_TCP
+					transportLen = 20
+				}
+				if want := tt.iphLen + transportLen + gsoSize; len(seg) != want {
+					t.Errorf("segment %d: got length %d, want %d", i, len(seg), want)
+				}
+				if !tt.isV6 {
+					if int(ipv4H.TotalLength()) != len(seg) {
+						t.Errorf("segment %d: ipv4 total length is %d, want %d", i, ipv4H.TotalLength(), len(seg))
+					}
+					if ipv4H.ID() != tt.baseID+uint16(i) {
+						t.Errorf("segment %d: ipv4 ID is %d, want %d", i, ipv4H.ID(), tt.baseID+uint16(i))
+					}
+					if gvisorchecksum.Checksum(seg[:tt.iphLen], 0) != 0xffff {
+						t.Errorf("segment %d: ipv4 header checksum is invalid", i)
+					}
+				} else {
+					if int(ipv6H.PayloadLength()) != len(seg)-tt.iphLen {
+						t.Errorf("segment %d: ipv6 payload length is %d, want %d", i, ipv6H.PayloadLength(), len(seg)-tt.iphLen)
+					}
+				}
+				var psum uint16
+				if tt.isV6 {
+					psum = header.PseudoHeaderChecksum(tcpip.TransportProtocolNumber(proto), ipv6H.SourceAddress(), ipv6H.DestinationAddress(), uint16(transportLen+gsoSize))
+				} else {
+					psum = header.PseudoHeaderChecksum(tcpip.TransportProtocolNumber(proto), ipv4H.SourceAddress(), ipv4H.DestinationAddress(), uint16(transportLen+gsoSize))
+				}
+				if got := gvisorchecksum.Checksum(seg[tt.iphLen:], psum); got != 0xffff {
+					t.Errorf("segment %d: transport checksum is invalid, sum is %#x", i, got)
+				}
+				if tt.tcp {
+					tcpH := header.TCP(seg[tt.iphLen:])
+					if want := tt.baseSeq + uint32(i*gsoSize); tcpH.SequenceNumber() != want {
+						t.Errorf("segment %d: tcp sequence number is %d, want %d", i, tcpH.SequenceNumber(), want)
+					}
+					wantFlags := header.TCPFlagAck
+					if i == n-1 {
+						wantFlags |= header.TCPFlagPsh
+					}
+					if tcpH.Flags() != wantFlags {
+						t.Errorf("segment %d: tcp flags are %#x, want %#x", i, tcpH.Flags(), wantFlags)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Fuzz_handleVirtioRead checks that no virtio net header, however mangled, can
+// make handleVirtioRead hand back a packet that runs past the end of its buffer
+// or panic outright.
+func Fuzz_handleVirtioRead(f *testing.F) {
+	tcp4 := tcp4Packet(ip4PortA, ip4PortB, header.TCPFlagAck|header.TCPFlagPsh, 200, 1)
+	udp4 := udp4Packet(ip4PortA, ip4PortB, 200)
+	tun := (&tunnelGSOSpec{segs: 3, gsoSize: 100, outerCSum: true}).build()
+	tun6 := (&tunnelGSOSpec{segs: 3, gsoSize: 100, outerV6: true, innerV6: true, innerUDP: true, outerCSum: true}).build()
+	for _, seed := range [][]byte{tcp4, udp4, tun, tun6, {}} {
+		f.Add(seed, uint8(virtioNetHdrLen))
+		f.Add(seed, uint8(virtioNetHdrTnlLen))
+	}
+	f.Fuzz(func(t *testing.T, in []byte, hdrSize uint8) {
+		if int(hdrSize) < virtioNetHdrLen {
+			hdrSize = uint8(virtioNetHdrLen)
+		} else if int(hdrSize) > virtioNetHdrTnlLen {
+			hdrSize = uint8(virtioNetHdrTnlLen)
+		}
+		out := make([][]byte, 8)
+		sizes := make([]int, 8)
+		for i := range out {
+			out[i] = make([]byte, 2048)
+		}
+		n, err := handleVirtioRead(in, out, sizes, offset, int(hdrSize))
+		if err != nil {
+			if !errors.Is(err, ErrTooManySegments) && n != 0 {
+				t.Fatalf("got %d packets with error %v", n, err)
+			}
+			return
+		}
+		for i := range n {
+			if sizes[i] < 0 || sizes[i] > len(out[i])-offset {
+				t.Fatalf("sizes[%d] = %d does not fit in the buffer of %d", i, sizes[i], len(out[i])-offset)
+			}
+		}
+	})
 }

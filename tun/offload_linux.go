@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"unsafe"
 
@@ -55,7 +56,63 @@ const (
 	// virtioNetHdrLen is the length in bytes of virtioNetHdr. This matches the
 	// shape of the C ABI for its kernel counterpart -- sizeof(virtio_net_hdr).
 	virtioNetHdrLen = int(unsafe.Sizeof(virtioNetHdr{}))
+
+	// virtioNetHdrTnlLen is the length in bytes of virtioNetHdrTnl, the
+	// extended header the kernel uses as soon as the UDP tunnel offloads of a
+	// tun device are enabled. This matches the shape of the C ABI for its
+	// kernel counterpart -- sizeof(virtio_net_hdr_v1_hash_tunnel).
+	virtioNetHdrTnlLen = 24
+
+	// The offsets of the tunnel specific fields of virtioNetHdrTnl.
+	outerThOffsetAt = 20
+	innerNhOffsetAt = 22
 )
+
+// The following are defined in the kernel in include/uapi/linux/virtio_net.h,
+// where golang.org/x/sys/unix has not caught up with them yet.
+const (
+	virtioNetHdrFUDPTunnelCSum   uint8 = 0x8  // VIRTIO_NET_HDR_F_UDP_TUNNEL_CSUM
+	virtioNetHdrGSOUDPTunnelIPv4 uint8 = 0x20 // VIRTIO_NET_HDR_GSO_UDP_TUNNEL_IPV4
+	virtioNetHdrGSOUDPTunnelIPv6 uint8 = 0x40 // VIRTIO_NET_HDR_GSO_UDP_TUNNEL_IPV6
+)
+
+const virtioNetHdrGSOUDPTunnel uint8 = virtioNetHdrGSOUDPTunnelIPv4 | virtioNetHdrGSOUDPTunnelIPv6
+
+// virtioNetHdrTnl is the kernel's virtio_net_hdr_v1_hash_tunnel. A GSO packet
+// carrying a GSO packet encapsulated by a UDP tunnel -- VxLAN, GENEVE, and
+// friends -- cannot be described by virtioNetHdr alone: the kernel also has to
+// tell us where the encapsulating headers sit within the packet.
+type virtioNetHdrTnl struct {
+	virtioNetHdr
+	outerThOffset uint16 // offset of the encapsulating transport header
+	innerNhOffset uint16 // offset of the encapsulated network header
+}
+
+func (v *virtioNetHdrTnl) decode(b []byte) error {
+	if err := v.virtioNetHdr.decode(b); err != nil {
+		return err
+	}
+	if len(b) < virtioNetHdrTnlLen {
+		return io.ErrShortBuffer
+	}
+	v.outerThOffset = binary.LittleEndian.Uint16(b[outerThOffsetAt:])
+	v.innerNhOffset = binary.LittleEndian.Uint16(b[innerNhOffsetAt:])
+	return nil
+}
+
+func (v *virtioNetHdrTnl) encode(b []byte) error {
+	if err := v.virtioNetHdr.encode(b); err != nil {
+		return err
+	}
+	if len(b) < virtioNetHdrTnlLen {
+		return io.ErrShortBuffer
+	}
+	// The fields between the two headers are the hash report and the flow hash,
+	// neither of which the kernel ever fills in for us.
+	binary.LittleEndian.PutUint16(b[outerThOffsetAt:], v.outerThOffset)
+	binary.LittleEndian.PutUint16(b[innerNhOffsetAt:], v.innerNhOffset)
+	return nil
+}
 
 // tcpFlowKey represents the key for a TCP flow.
 type tcpFlowKey struct {
@@ -386,15 +443,29 @@ func tcpPacketsCanCoalesce(pkt []byte, iphLen, tcphLen uint8, seq uint32, pshSet
 }
 
 func checksumValid(pkt []byte, iphLen, proto uint8, isV6 bool) bool {
-	srcAddrAt := ipv4SrcAddrOffset
+	return checksumValidAt(pkt, 0, int(iphLen), proto, isV6)
+}
+
+// checksumValidAt is checksumValid for an IP header that does not begin at the
+// front of pkt, which is what an encapsulated packet needs.
+func checksumValidAt(pkt []byte, iphAt, iphLen int, proto uint8, isV6 bool) bool {
+	if iphAt < 0 || iphAt+iphLen > len(pkt) {
+		return false
+	}
+	srcAddrAt := iphAt + ipv4SrcAddrOffset
 	addrSize := 4
 	if isV6 {
-		srcAddrAt = ipv6SrcAddrOffset
+		srcAddrAt = iphAt + ipv6SrcAddrOffset
 		addrSize = 16
 	}
-	lenForPseudo := uint16(len(pkt) - int(iphLen))
-	cSum := pseudoHeaderChecksumNoFold(proto, pkt[srcAddrAt:srcAddrAt+addrSize], pkt[srcAddrAt+addrSize:srcAddrAt+addrSize*2], lenForPseudo)
-	return ^checksum(pkt[iphLen:], cSum) == 0
+	if srcAddrAt+addrSize*2 > len(pkt) {
+		return false
+	}
+	lenForPseudo := uint16(len(pkt) - iphAt - int(iphLen))
+	srcAddr := pkt[srcAddrAt : srcAddrAt+addrSize]
+	dstAddr := pkt[srcAddrAt+addrSize : srcAddrAt+addrSize*2]
+	cSum := pseudoHeaderChecksumNoFold(proto, srcAddr, dstAddr, lenForPseudo)
+	return ^checksum(pkt[iphAt+iphLen:], cSum) == 0
 }
 
 // coalesceResult represents the result of attempting to coalesce two TCP
@@ -512,6 +583,8 @@ const (
 const (
 	ipv4SrcAddrOffset = 12
 	ipv6SrcAddrOffset = 8
+	ipv4AddrLen       = 4
+	ipv6AddrLen       = 16
 	maxUint16         = 1<<16 - 1
 )
 
@@ -624,9 +697,48 @@ func tcpGRO(bufs [][]byte, offset int, pktI int, table *tcpGROTable, isV6 bool) 
 	return groResultTableInsert
 }
 
+// groHdrStore is where the virtio net header of each packet is left for the
+// write to pick up. When the kernel expects a 10 byte header that is the space
+// immediately before the packet in its own buffer. When it expects the larger
+// tunnel header it is a scratch area instead, because the space a Device hands
+// handleGRO in front of each packet is only 16 bytes and the tunnel header is
+// 24.
+type groHdrStore struct {
+	bufs    [][]byte
+	offset  int
+	scratch [][]byte // nil when the space before the packet is used
+}
+
+// at returns the 10 byte header slot of packet i.
+func (s *groHdrStore) at(i int) []byte {
+	if s.scratch != nil {
+		return s.scratch[i][:virtioNetHdrLen:virtioNetHdrLen]
+	}
+	return s.bufs[i][s.offset-virtioNetHdrLen : s.offset]
+}
+
+// tnlAt returns the full header slot of packet i, which is only wide enough for
+// a tunnel header when a scratch area is in use.
+func (s *groHdrStore) tnlAt(i int) []byte {
+	if s.scratch != nil {
+		return s.scratch[i][:virtioNetHdrTnlLen:virtioNetHdrTnlLen]
+	}
+	return s.bufs[i][s.offset-virtioNetHdrLen : s.offset]
+}
+
+// zero clears the whole header slot of packet i, leaving it as a plain packet
+// with no offload.
+func (s *groHdrStore) zero(i int) {
+	if s.scratch != nil {
+		clear(s.scratch[i])
+		return
+	}
+	clear(s.bufs[i][s.offset-virtioNetHdrLen : s.offset])
+}
+
 // applyTCPCoalesceAccounting updates bufs to account for coalescing based on the
 // metadata found in table.
-func applyTCPCoalesceAccounting(bufs [][]byte, offset int, table *tcpGROTable) error {
+func applyTCPCoalesceAccounting(bufs [][]byte, offset int, table *tcpGROTable, store *groHdrStore) error {
 	for _, items := range table.itemsByFlow {
 		for _, item := range items {
 			if item.numMerged > 0 {
@@ -651,7 +763,7 @@ func applyTCPCoalesceAccounting(bufs [][]byte, offset int, table *tcpGROTable) e
 					iphCSum := ^checksum(pkt[:item.iphLen], 0)            // compute IPv4 header checksum
 					binary.BigEndian.PutUint16(pkt[10:], iphCSum)         // set IPv4 header checksum field
 				}
-				err := hdr.encode(bufs[item.bufsIndex][offset-virtioNetHdrLen:])
+				err := hdr.encode(store.at(int(item.bufsIndex)))
 				if err != nil {
 					return err
 				}
@@ -670,8 +782,6 @@ func applyTCPCoalesceAccounting(bufs [][]byte, offset int, table *tcpGROTable) e
 				dstAddr := bufs[item.bufsIndex][srcAddrAt+addrLen : srcAddrAt+addrLen*2]
 				psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_TCP, srcAddr, dstAddr, uint16(len(pkt)-int(item.iphLen)))
 				binary.BigEndian.PutUint16(pkt[hdr.csumStart+hdr.csumOffset:], checksum([]byte{}, psum))
-			} else {
-				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
 			}
 		}
 	}
@@ -680,7 +790,7 @@ func applyTCPCoalesceAccounting(bufs [][]byte, offset int, table *tcpGROTable) e
 
 // applyUDPCoalesceAccounting updates bufs to account for coalescing based on the
 // metadata found in table.
-func applyUDPCoalesceAccounting(bufs [][]byte, offset int, table *udpGROTable) error {
+func applyUDPCoalesceAccounting(bufs [][]byte, offset int, table *udpGROTable, store *groHdrStore) error {
 	for _, items := range table.itemsByFlow {
 		for _, item := range items {
 			if item.numMerged > 0 {
@@ -704,7 +814,7 @@ func applyUDPCoalesceAccounting(bufs [][]byte, offset int, table *udpGROTable) e
 					iphCSum := ^checksum(pkt[:item.iphLen], 0)            // compute IPv4 header checksum
 					binary.BigEndian.PutUint16(pkt[10:], iphCSum)         // set IPv4 header checksum field
 				}
-				err := hdr.encode(bufs[item.bufsIndex][offset-virtioNetHdrLen:])
+				err := hdr.encode(store.at(int(item.bufsIndex)))
 				if err != nil {
 					return err
 				}
@@ -726,8 +836,6 @@ func applyUDPCoalesceAccounting(bufs [][]byte, offset int, table *udpGROTable) e
 				dstAddr := bufs[item.bufsIndex][srcAddrAt+addrLen : srcAddrAt+addrLen*2]
 				psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_UDP, srcAddr, dstAddr, uint16(len(pkt)-int(item.iphLen)))
 				binary.BigEndian.PutUint16(pkt[hdr.csumStart+hdr.csumOffset:], checksum([]byte{}, psum))
-			} else {
-				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
 			}
 		}
 	}
@@ -742,9 +850,17 @@ const (
 	tcp6GROCandidate
 	udp4GROCandidate
 	udp6GROCandidate
+	vxlan4GROCandidate
+	vxlan6GROCandidate
 )
 
-func packetIsGROCandidate(b []byte, canUDPGRO bool) groCandidateType {
+// minTnlLen is the smallest packet that could hold an IPv4 tunnel header, a
+// VxLAN header, an Ethernet header, an IPv4 header and a TCP header. IPv6
+// outer headers are larger still, but this is only a first filter: parseTunnel
+// does the exact bounds checking.
+const minTnlLen = ipv4HeaderLen + udphLen + vxlanLen + ethHdrLen + ipv4HeaderLen + 20
+
+func packetIsGROCandidate(b []byte, canUDPGRO, canTunnelGRO bool) groCandidateType {
 	if len(b) < 28 {
 		return notGROCandidate
 	}
@@ -757,6 +873,9 @@ func packetIsGROCandidate(b []byte, canUDPGRO bool) groCandidateType {
 			return tcp4GROCandidate
 		}
 		if b[9] == unix.IPPROTO_UDP && canUDPGRO {
+			if canTunnelGRO && len(b) >= minTnlLen && isVxlanPort(binary.BigEndian.Uint16(b[ipv4HeaderLen+2:])) {
+				return vxlan4GROCandidate
+			}
 			return udp4GROCandidate
 		}
 	} else if b[0]>>4 == 6 {
@@ -764,6 +883,9 @@ func packetIsGROCandidate(b []byte, canUDPGRO bool) groCandidateType {
 			return tcp6GROCandidate
 		}
 		if b[6] == unix.IPPROTO_UDP && len(b) >= 48 && canUDPGRO {
+			if canTunnelGRO && len(b) >= minTnlLen+ipv6HeaderLen-ipv4HeaderLen && isVxlanPort(binary.BigEndian.Uint16(b[ipv6HeaderLen+2:])) {
+				return vxlan6GROCandidate
+			}
 			return udp6GROCandidate
 		}
 	}
@@ -771,7 +893,10 @@ func packetIsGROCandidate(b []byte, canUDPGRO bool) groCandidateType {
 }
 
 const (
-	udphLen = 8
+	ipv4HeaderLen = 20
+	ipv6HeaderLen = 40
+	udphLen       = 8
+	vxlanLen      = 8 // the fixed part of a VxLAN or VxLAN-GPE header
 )
 
 // udpGRO evaluates the UDP packet at pktI in bufs for coalescing with
@@ -857,14 +982,18 @@ func udpGRO(bufs [][]byte, offset int, pktI int, table *udpGROTable, isV6 bool) 
 // packets into toWrite. toWrite, tcpTable, and udpTable should initially be
 // empty (but non-nil), and are passed in to save allocs as the caller may reset
 // and recycle them across vectors of packets. canUDPGRO indicates if UDP GRO is
-// supported.
-func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGROTable, canUDPGRO bool, toWrite *[]int) error {
+// supported. tnlTable is nil when the kernel will not accept a tunnel GSO
+// header, in which case encapsulated packets are coalesced as plain UDP. When
+// hdrs is non-nil it is a scratch area, one virtioNetHdrTnlLen sized slot per
+// buffer, that holds the headers instead of the space in front of each packet.
+func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGROTable, tnlTable *tunnelGROTable, canUDPGRO bool, hdrs [][]byte, toWrite *[]int) error {
+	store := &groHdrStore{bufs: bufs, offset: offset, scratch: hdrs}
 	for i := range bufs {
 		if offset < virtioNetHdrLen || offset > len(bufs[i])-1 {
 			return errors.New("invalid offset")
 		}
 		var result groResult
-		switch packetIsGROCandidate(bufs[i][offset:], canUDPGRO) {
+		switch candidate := packetIsGROCandidate(bufs[i][offset:], canUDPGRO, tnlTable != nil); candidate {
 		case tcp4GROCandidate:
 			result = tcpGRO(bufs, offset, i, tcpTable, false)
 		case tcp6GROCandidate:
@@ -873,41 +1002,149 @@ func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGR
 			result = udpGRO(bufs, offset, i, udpTable, false)
 		case udp6GROCandidate:
 			result = udpGRO(bufs, offset, i, udpTable, true)
+		case vxlan4GROCandidate, vxlan6GROCandidate:
+			result = tunnelGRO(bufs, offset, i, tnlTable)
+			if result == groResultNoop {
+				// An encapsulated packet we cannot describe as tunnel GSO is still
+				// a plain UDP datagram, so fall back to coalescing it as one.
+				result = udpGRO(bufs, offset, i, udpTable, candidate == vxlan6GROCandidate)
+			}
 		}
 		switch result {
-		case groResultNoop:
-			clear(bufs[i][offset-virtioNetHdrLen : offset])
-			fallthrough
-		case groResultTableInsert:
+		case groResultNoop, groResultTableInsert:
+			// The packet is written as it arrived, so its header has to describe
+			// no offload at all. A packet that later merges into a group gets its
+			// header rewritten by the accounting below.
+			store.zero(i)
 			*toWrite = append(*toWrite, i)
 		}
 	}
-	errTCP := applyTCPCoalesceAccounting(bufs, offset, tcpTable)
-	errUDP := applyUDPCoalesceAccounting(bufs, offset, udpTable)
-	return errors.Join(errTCP, errUDP)
+	errTCP := applyTCPCoalesceAccounting(bufs, offset, tcpTable, store)
+	errUDP := applyUDPCoalesceAccounting(bufs, offset, udpTable, store)
+	errTnl := applyTunnelCoalesceAccounting(bufs, offset, tnlTable, store)
+	return errors.Join(errTCP, errUDP, errTnl)
+}
+
+// gsoLayout describes the headers of a GSO packet, so that the packet can be
+// split into segments. The transport header described by transportAt is the one
+// whose checksum GSO offload leaves for us to compute; for a packet that is not
+// encapsulated it is also the outermost transport header, and so the outer and
+// inner IP headers are one and the same.
+type gsoLayout struct {
+	outerIphAt   int  // offset of the outermost IP header
+	outerIphLen  int  // length of the outermost IP header
+	outerIsV6    bool // the outermost IP header is IPv6
+	outerUdpAt   int  // offset of the encapsulating UDP header, or -1
+	outerCSum    bool // the encapsulating UDP checksum is ours to compute
+	innerIphAt   int  // offset of the innermost IP header
+	innerIphLen  int  // length of the innermost IP header
+	innerIsV6    bool // the innermost IP header is IPv6
+	transportAt  int  // offset of the transport header carrying the GSO checksum
+	transportLen int  // length of that transport header
+	csumOffset   int  // offset of the checksum field within that header
+	protocol     uint8
+	vxlanAt      int // offset of the encapsulating tunnel header, or -1
+	innerEthAt   int // offset of the encapsulated MAC header, or -1
+}
+
+// transportHeaderLen returns the length of the transport header at transportAt
+// in b, whose payload protocol is protocol.
+// transportHeaderLen returns the length of the transport header at transportAt
+// in b, whose payload protocol is protocol. The GSO split and the GRO paths use
+// it together so that they cannot disagree about what a header is.
+func transportHeaderLen(b []byte, transportAt int, protocol uint8) (int, error) {
+	if protocol == unix.IPPROTO_UDP {
+		if transportAt+udphLen > len(b) {
+			return 0, errors.New("packet is too short")
+		}
+		return udphLen, nil
+	}
+	if transportAt+20 > len(b) {
+		return 0, errors.New("packet is too short")
+	}
+	tcpHLen := int(b[transportAt+12]>>4) * 4
+	if tcpHLen < 20 || tcpHLen > 60 {
+		// A TCP header must be between 20 and 60 bytes in length.
+		return 0, fmt.Errorf("tcp header len is invalid: %d", tcpHLen)
+	}
+	return tcpHLen, nil
+}
+
+// ipSegmentAddrs returns the source and destination addresses of the IP header
+// of length iphLen at iphAt in b.
+func ipSegmentAddrs(b []byte, iphAt int, isV6 bool) (src, dst []byte) {
+	if isV6 {
+		return b[iphAt+ipv6SrcAddrOffset : iphAt+ipv6SrcAddrOffset+ipv6AddrLen],
+			b[iphAt+ipv6SrcAddrOffset+ipv6AddrLen : iphAt+ipv6SrcAddrOffset+ipv6AddrLen*2]
+	}
+	return b[iphAt+ipv4SrcAddrOffset : iphAt+ipv4SrcAddrOffset+ipv4AddrLen],
+		b[iphAt+ipv4SrcAddrOffset+ipv4AddrLen : iphAt+ipv4SrcAddrOffset+ipv4AddrLen*2]
+}
+
+// setIPLen updates the length, identification, and checksum fields of the IP
+// header of length iphLen at iphAt in b, which describes the i'th segment of a
+// GSO packet whose total length is totalLen. The header checksum field of IPv4
+// headers must have been cleared beforehand, in the template every segment is
+// copied from.
+func setIPLen(b []byte, iphAt, iphLen, totalLen, i int, isV6 bool) {
+	if isV6 {
+		// For IPv6 we are responsible for updating the payload length field.
+		binary.BigEndian.PutUint16(b[iphAt+4:], uint16(totalLen-iphLen))
+		return
+	}
+	// For IPv4 we are responsible for incrementing the ID field, updating the
+	// total len field, and recalculating the header checksum.
+	if i > 0 {
+		id := binary.BigEndian.Uint16(b[iphAt+4:])
+		id += uint16(i)
+		binary.BigEndian.PutUint16(b[iphAt+4:], id)
+	}
+	binary.BigEndian.PutUint16(b[iphAt+2:], uint16(totalLen))
+	ipv4CSum := ^checksum(b[iphAt:iphAt+iphLen], 0)
+	binary.BigEndian.PutUint16(b[iphAt+10:], ipv4CSum)
+}
+
+// outBufLen reports how many bytes gsoSplit may write in each of the buffers it
+// was handed, or a negative number when there are no usable buffers at all.
+func outBufLen(outBuffs [][]byte, outOffset int) int {
+	if len(outBuffs) == 0 || outOffset > len(outBuffs[0]) {
+		return -1
+	}
+	return len(outBuffs[0]) - outOffset
 }
 
 // gsoSplit splits packets from in into outBuffs, writing the size of each
 // element into sizes. It returns the number of buffers populated, and/or an
 // error.
-func gsoSplit(in []byte, hdr virtioNetHdr, outBuffs [][]byte, sizes []int, outOffset int, isV6 bool) (int, error) {
-	iphLen := int(hdr.csumStart)
-	srcAddrOffset := ipv6SrcAddrOffset
-	addrLen := 16
-	if !isV6 {
-		in[10], in[11] = 0, 0 // clear ipv4 header checksum
-		srcAddrOffset = ipv4SrcAddrOffset
-		addrLen = 4
+func gsoSplit(in []byte, hdr virtioNetHdr, l gsoLayout, outBuffs [][]byte, sizes []int, outOffset int) (int, error) {
+	// Every segment is a copy of the template's headers plus at most gsoSize
+	// bytes of payload, so the longest segment this packet can yield has to fit
+	// in the buffers we were handed.
+	maxSegment := int(hdr.hdrLen) + int(hdr.gsoSize)
+	if len(in) < maxSegment {
+		maxSegment = len(in)
 	}
-	transportCsumAt := int(hdr.csumStart + hdr.csumOffset)
+	if bufLen := outBufLen(outBuffs, outOffset); maxSegment > bufLen {
+		return 0, fmt.Errorf("segment length (%d) exceeds output buffer length (%d)", maxSegment, bufLen)
+	}
+
+	// Clear the checksums that every segment gets its own copy of, so that the
+	// headers copied from the template below do not carry stale values over.
+	if !l.outerIsV6 {
+		in[l.outerIphAt+10], in[l.outerIphAt+11] = 0, 0 // clear ipv4 header checksum
+	}
+	if l.innerIphAt != l.outerIphAt && !l.innerIsV6 {
+		in[l.innerIphAt+10], in[l.innerIphAt+11] = 0, 0 // clear inner ipv4 header checksum
+	}
+	transportCsumAt := l.transportAt + l.csumOffset
 	in[transportCsumAt], in[transportCsumAt+1] = 0, 0 // clear tcp/udp checksum
+	if l.outerUdpAt >= 0 && l.outerCSum {
+		in[l.outerUdpAt+6], in[l.outerUdpAt+7] = 0, 0 // clear the encapsulating udp checksum
+	}
+
 	var firstTCPSeqNum uint32
-	var protocol uint8
-	if hdr.gsoType == unix.VIRTIO_NET_HDR_GSO_TCPV4 || hdr.gsoType == unix.VIRTIO_NET_HDR_GSO_TCPV6 {
-		protocol = unix.IPPROTO_TCP
-		firstTCPSeqNum = binary.BigEndian.Uint32(in[hdr.csumStart+4:])
-	} else {
-		protocol = unix.IPPROTO_UDP
+	if l.protocol == unix.IPPROTO_TCP {
+		firstTCPSeqNum = binary.BigEndian.Uint32(in[l.transportAt+4:])
 	}
 	nextSegmentDataAt := int(hdr.hdrLen)
 	i := 0
@@ -924,50 +1161,53 @@ func gsoSplit(in []byte, hdr virtioNetHdr, outBuffs [][]byte, sizes []int, outOf
 		sizes[i] = totalLen
 		out := outBuffs[i][outOffset:]
 
-		copy(out, in[:iphLen])
-		if !isV6 {
-			// For IPv4 we are responsible for incrementing the ID field,
-			// updating the total len field, and recalculating the header
-			// checksum.
-			if i > 0 {
-				id := binary.BigEndian.Uint16(out[4:])
-				id += uint16(i)
-				binary.BigEndian.PutUint16(out[4:], id)
-			}
-			binary.BigEndian.PutUint16(out[2:], uint16(totalLen))
-			ipv4CSum := ^checksum(out[:iphLen], 0)
-			binary.BigEndian.PutUint16(out[10:], ipv4CSum)
-		} else {
-			// For IPv6 we are responsible for updating the payload length field.
-			binary.BigEndian.PutUint16(out[4:], uint16(totalLen-iphLen))
+		// copy all headers, including the encapsulating ones
+		copy(out, in[:hdr.hdrLen])
+
+		setIPLen(out, l.outerIphAt, l.outerIphLen, totalLen, i, l.outerIsV6)
+		if l.outerUdpAt >= 0 {
+			// The encapsulating UDP header covers the encapsulated packet.
+			binary.BigEndian.PutUint16(out[l.outerUdpAt+4:], uint16(totalLen-l.outerUdpAt))
+		}
+		if l.innerIphAt != l.outerIphAt {
+			setIPLen(out, l.innerIphAt, l.innerIphLen, totalLen-l.innerIphAt, i, l.innerIsV6)
 		}
 
-		// copy transport header
-		copy(out[hdr.csumStart:hdr.hdrLen], in[hdr.csumStart:hdr.hdrLen])
-
-		if protocol == unix.IPPROTO_TCP {
+		if l.protocol == unix.IPPROTO_TCP {
 			// set TCP seq and adjust TCP flags
 			tcpSeq := firstTCPSeqNum + uint32(hdr.gsoSize*uint16(i))
-			binary.BigEndian.PutUint32(out[hdr.csumStart+4:], tcpSeq)
+			binary.BigEndian.PutUint32(out[l.transportAt+4:], tcpSeq)
 			if nextSegmentEnd != len(in) {
 				// FIN and PSH should only be set on last segment
 				clearFlags := tcpFlagFIN | tcpFlagPSH
-				out[hdr.csumStart+tcpFlagsOffset] &^= clearFlags
+				out[l.transportAt+tcpFlagsOffset] &^= clearFlags
 			}
 		} else {
 			// set UDP header len
-			binary.BigEndian.PutUint16(out[hdr.csumStart+4:], uint16(segmentDataLen)+(hdr.hdrLen-hdr.csumStart))
+			binary.BigEndian.PutUint16(out[l.transportAt+4:], uint16(segmentDataLen)+uint16(l.transportLen))
 		}
 
 		// payload
 		copy(out[hdr.hdrLen:], in[nextSegmentDataAt:nextSegmentEnd])
 
 		// transport checksum
-		transportHeaderLen := int(hdr.hdrLen - hdr.csumStart)
-		lenForPseudo := uint16(transportHeaderLen + segmentDataLen)
-		transportCSumNoFold := pseudoHeaderChecksumNoFold(protocol, in[srcAddrOffset:srcAddrOffset+addrLen], in[srcAddrOffset+addrLen:srcAddrOffset+addrLen*2], lenForPseudo)
-		transportCSum := ^checksum(out[hdr.csumStart:totalLen], transportCSumNoFold)
-		binary.BigEndian.PutUint16(out[hdr.csumStart+hdr.csumOffset:], transportCSum)
+		srcAddr, dstAddr := ipSegmentAddrs(in, l.innerIphAt, l.innerIsV6)
+		lenForPseudo := uint16(l.transportLen + segmentDataLen)
+		transportCSumNoFold := pseudoHeaderChecksumNoFold(l.protocol, srcAddr, dstAddr, lenForPseudo)
+		transportCSum := ^checksum(out[l.transportAt:totalLen], transportCSumNoFold)
+		binary.BigEndian.PutUint16(out[l.transportAt+l.csumOffset:], transportCSum)
+
+		// encapsulating UDP checksum
+		if l.outerUdpAt >= 0 && l.outerCSum {
+			srcAddr, dstAddr := ipSegmentAddrs(in, l.outerIphAt, l.outerIsV6)
+			udpLen := uint16(totalLen - l.outerUdpAt)
+			cSumNoFold := pseudoHeaderChecksumNoFold(unix.IPPROTO_UDP, srcAddr, dstAddr, udpLen)
+			cSum := ^checksum(out[l.outerUdpAt:totalLen], cSumNoFold)
+			if cSum == 0 {
+				cSum = 0xffff // a zero checksum means "no checksum" in IPv4 UDP
+			}
+			binary.BigEndian.PutUint16(out[l.outerUdpAt+6:], cSum)
+		}
 
 		nextSegmentDataAt += int(hdr.gsoSize)
 	}
@@ -975,7 +1215,10 @@ func gsoSplit(in []byte, hdr virtioNetHdr, outBuffs [][]byte, sizes []int, outOf
 }
 
 func gsoNoneChecksum(in []byte, cSumStart, cSumOffset uint16) error {
-	cSumAt := cSumStart + cSumOffset
+	cSumAt := int(cSumStart) + int(cSumOffset)
+	if cSumAt+1 >= len(in) {
+		return fmt.Errorf("end of checksum offset (%d) exceeds packet length (%d)", cSumAt+1, len(in))
+	}
 	// The initial value at the checksum offset should be summed with the
 	// checksum we compute. This is typically the pseudo-header checksum.
 	initial := binary.BigEndian.Uint16(in[cSumAt:])
