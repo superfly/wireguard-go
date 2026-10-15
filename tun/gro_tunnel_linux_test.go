@@ -12,8 +12,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// tnlFixture builds packets as they arrive off the wire: a TCP segment inside
-// an Ethernet frame inside a VxLAN datagram.
+// tnlFixture builds packets as they arrive off the wire: a TCP segment or UDP
+// datagram inside an Ethernet frame inside a VxLAN datagram.
 type tnlFixture struct {
 	outerV6, innerV6       bool
 	outerSrc, outerDst     []byte
@@ -27,6 +27,8 @@ type tnlFixture struct {
 	ack                    uint32
 	window                 uint16
 	tcpOptions             int
+	proto                  uint8 // IPPROTO_TCP or IPPROTO_UDP
+	innerZeroCSum          bool  // leave the inner UDP checksum unchecked
 }
 
 func newTnlFixture(outerV6, innerV6 bool) *tnlFixture {
@@ -45,6 +47,7 @@ func newTnlFixture(outerV6, innerV6 bool) *tnlFixture {
 		udpCsum:    true,
 		ack:        7000,
 		window:     65535,
+		proto:      unix.IPPROTO_TCP,
 	}
 	if outerV6 {
 		f.outerSrc = bytes.Repeat([]byte{0x20, 0x01, 0x0d, 0xb8}, 4)
@@ -75,9 +78,13 @@ func (f *tnlFixture) tcpAt() int {
 	return f.outerIphLen() + udphLen + vxlanLen + ethHdrLen + f.innerIphLen()
 }
 
-// pkt builds one encapsulated TCP segment carrying payload.
+// pkt builds one encapsulated TCP segment, or UDP datagram when f.proto says
+// so, carrying payload. seq and flags are ignored for UDP.
 func (f *tnlFixture) pkt(seq uint32, payload []byte, flags byte) []byte {
 	tcpLen := 20 + f.tcpOptions
+	if f.proto == unix.IPPROTO_UDP {
+		tcpLen = udphLen
+	}
 	total := f.tcpAt() + tcpLen + len(payload)
 	b := make([]byte, total)
 
@@ -126,7 +133,7 @@ func (f *tnlFixture) pkt(seq uint32, payload []byte, flags byte) []byte {
 	if f.innerV6 {
 		b[innerIphAt] = 6 << 4
 		binary.BigEndian.PutUint16(b[innerIphAt+4:], uint16(total-innerIphAt-ipv6HeaderLen))
-		b[innerIphAt+6] = unix.IPPROTO_TCP
+		b[innerIphAt+6] = f.proto
 		b[innerIphAt+7] = 64
 		copy(b[innerIphAt+8:], f.innerSrc)
 		copy(b[innerIphAt+24:], f.innerDst)
@@ -134,29 +141,42 @@ func (f *tnlFixture) pkt(seq uint32, payload []byte, flags byte) []byte {
 		b[innerIphAt] = 4<<4 | 5
 		binary.BigEndian.PutUint16(b[innerIphAt+2:], uint16(total-innerIphAt))
 		binary.BigEndian.PutUint16(b[innerIphAt+4:], f.innerIPID)
-		b[innerIphAt+9] = unix.IPPROTO_TCP
+		b[innerIphAt+9] = f.proto
 		copy(b[innerIphAt+12:], f.innerSrc)
 		copy(b[innerIphAt+16:], f.innerDst)
 		binary.BigEndian.PutUint16(b[innerIphAt+10:], ^checksum(b[innerIphAt:innerIphAt+ipv4HeaderLen], 0))
 	}
 
-	// inner TCP header
 	tcpAt := innerIphAt + f.innerIphLen()
 	binary.BigEndian.PutUint16(b[tcpAt:], f.innerSport)
 	binary.BigEndian.PutUint16(b[tcpAt+2:], f.innerDport)
-	binary.BigEndian.PutUint32(b[tcpAt+4:], seq)
-	binary.BigEndian.PutUint32(b[tcpAt+8:], f.ack)
-	b[tcpAt+12] = byte(tcpLen / 4 << 4)
-	b[tcpAt+13] = flags
-	binary.BigEndian.PutUint16(b[tcpAt+14:], f.window)
-	if f.tcpOptions > 0 {
-		copy(b[tcpAt+20:], bytes.Repeat([]byte{byte(0x02)}, f.tcpOptions-2)) // MSS option
-	}
 	copy(b[tcpAt+tcpLen:], payload)
 
-	// inner TCP checksum
-	psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_TCP, f.innerSrc, f.innerDst, uint16(tcpLen+len(payload)))
-	binary.BigEndian.PutUint16(b[tcpAt+16:], ^checksum(b[tcpAt:], psum))
+	if f.proto == unix.IPPROTO_UDP {
+		// inner UDP header
+		binary.BigEndian.PutUint16(b[tcpAt+4:], uint16(udphLen+len(payload)))
+		if !f.innerZeroCSum {
+			psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_UDP, f.innerSrc, f.innerDst, uint16(udphLen+len(payload)))
+			csum := ^checksum(b[tcpAt:], psum)
+			if csum == 0 {
+				csum = 0xffff // a zero checksum means unchecked, so avoid producing one
+			}
+			binary.BigEndian.PutUint16(b[tcpAt+6:], csum)
+		}
+	} else {
+		// inner TCP header
+		binary.BigEndian.PutUint32(b[tcpAt+4:], seq)
+		binary.BigEndian.PutUint32(b[tcpAt+8:], f.ack)
+		b[tcpAt+12] = byte(tcpLen / 4 << 4)
+		b[tcpAt+13] = flags
+		binary.BigEndian.PutUint16(b[tcpAt+14:], f.window)
+		if f.tcpOptions > 0 {
+			copy(b[tcpAt+20:], bytes.Repeat([]byte{byte(0x02)}, f.tcpOptions-2)) // MSS option
+		}
+		// inner TCP checksum
+		psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_TCP, f.innerSrc, f.innerDst, uint16(tcpLen+len(payload)))
+		binary.BigEndian.PutUint16(b[tcpAt+16:], ^checksum(b[tcpAt:], psum))
+	}
 
 	// encapsulating UDP checksum
 	if f.udpCsum {
@@ -230,56 +250,66 @@ func runTnlGRO(t *testing.T, pkts [][]byte) ([][]byte, [][]byte, []int, *tunnelG
 // coalesced by handleGRO are fed back through the split that mirrors the
 // kernel's, and must come out byte for byte as the packets that went in.
 func Test_tunnelGRO_roundTrip(t *testing.T) {
-	for _, outerV6 := range []bool{false, true} {
-		for _, innerV6 := range []bool{false, true} {
-			for _, segs := range []int{1, 2, 3, 9} {
-				for _, payload := range []int{1, 100, 1360} {
-					f := newTnlFixture(outerV6, innerV6)
-					var pkts [][]byte
-					for i := 0; i < segs; i++ {
-						flags := byte(tcpFlagACK)
-						if i == segs-1 {
-							flags |= tcpFlagPSH
-						}
-						// A sender segments a GSO packet by incrementing the
-						// identification field of every header, so that is what
-						// the packets we have to reproduce look like.
-						f.outerIPID = uint16(i)
-						f.innerIPID = uint16(i)
-						pkts = append(pkts, f.pkt(1000+uint32(i*payload), bytes.Repeat([]byte{byte(i)}, payload), flags))
-					}
-					name := map[bool]string{false: "v4", true: "v6"}
-					t.Run("outer"+name[outerV6]+"-inner"+name[innerV6]+"-segs"+strconv.Itoa(segs)+"-payload"+strconv.Itoa(payload), func(t *testing.T) {
-						bufs, hdrs, toWrite, table := runTnlGRO(t, pkts)
-						if len(toWrite) != 1 {
-							t.Fatalf("handleGRO wrote %d packets, want 1", len(toWrite))
-						}
-						const offset = 16
-						in := make([]byte, 0, virtioNetHdrTnlLen+len(bufs[toWrite[0]])-offset)
-						in = append(in, asReadByKernel(hdrs[toWrite[0]])...)
-						in = append(in, bufs[toWrite[0]][offset:]...)
-
-						outBufs := make([][]byte, segs)
-						for i := range outBufs {
-							outBufs[i] = make([]byte, 65535)
-						}
-						sizes := make([]int, segs)
-						n, err := handleVirtioRead(in, outBufs, sizes, 0, virtioNetHdrTnlLen)
-						if err != nil {
-							t.Fatalf("handleVirtioRead: %v", err)
-						}
-						if n != segs {
-							t.Fatalf("split into %d packets, want %d", n, segs)
-						}
+	protos := []struct {
+		name  string
+		proto uint8
+	}{
+		{"tcp", unix.IPPROTO_TCP},
+		{"udp", unix.IPPROTO_UDP},
+	}
+	for _, proto := range protos {
+		for _, outerV6 := range []bool{false, true} {
+			for _, innerV6 := range []bool{false, true} {
+				for _, segs := range []int{1, 2, 3, 9} {
+					for _, payload := range []int{1, 100, 1360} {
+						f := newTnlFixture(outerV6, innerV6)
+						f.proto = proto.proto
+						var pkts [][]byte
 						for i := 0; i < segs; i++ {
-							if !bytes.Equal(outBufs[i][:sizes[i]], pkts[i]) {
-								t.Fatalf("segment %d differs:\n got %x\nwant %x", i, outBufs[i][:sizes[i]], pkts[i])
+							flags := byte(tcpFlagACK)
+							if i == segs-1 {
+								flags |= tcpFlagPSH
 							}
+							// A sender segments a GSO packet by incrementing the
+							// identification field of every header, so that is what
+							// the packets we have to reproduce look like.
+							f.outerIPID = uint16(i)
+							f.innerIPID = uint16(i)
+							pkts = append(pkts, f.pkt(1000+uint32(i*payload), bytes.Repeat([]byte{byte(i)}, payload), flags))
 						}
-						if want := segs - 1; table.stats.Merged != uint64(want) {
-							t.Fatalf("Merged = %d, want %d", table.stats.Merged, want)
-						}
-					})
+						name := map[bool]string{false: "v4", true: "v6"}
+						t.Run(proto.name+"-outer"+name[outerV6]+"-inner"+name[innerV6]+"-segs"+strconv.Itoa(segs)+"-payload"+strconv.Itoa(payload), func(t *testing.T) {
+							bufs, hdrs, toWrite, table := runTnlGRO(t, pkts)
+							if len(toWrite) != 1 {
+								t.Fatalf("handleGRO wrote %d packets, want 1", len(toWrite))
+							}
+							const offset = 16
+							in := make([]byte, 0, virtioNetHdrTnlLen+len(bufs[toWrite[0]])-offset)
+							in = append(in, asReadByKernel(hdrs[toWrite[0]])...)
+							in = append(in, bufs[toWrite[0]][offset:]...)
+
+							outBufs := make([][]byte, segs)
+							for i := range outBufs {
+								outBufs[i] = make([]byte, 65535)
+							}
+							sizes := make([]int, segs)
+							n, err := handleVirtioRead(in, outBufs, sizes, 0, virtioNetHdrTnlLen)
+							if err != nil {
+								t.Fatalf("handleVirtioRead: %v", err)
+							}
+							if n != segs {
+								t.Fatalf("split into %d packets, want %d", n, segs)
+							}
+							for i := 0; i < segs; i++ {
+								if !bytes.Equal(outBufs[i][:sizes[i]], pkts[i]) {
+									t.Fatalf("segment %d differs:\n got %x\nwant %x", i, outBufs[i][:sizes[i]], pkts[i])
+								}
+							}
+							if want := segs - 1; table.stats.Merged != uint64(want) {
+								t.Fatalf("Merged = %d, want %d", table.stats.Merged, want)
+							}
+						})
+					}
 				}
 			}
 		}
@@ -348,6 +378,160 @@ func Test_tunnelGRO_header(t *testing.T) {
 	}
 	if csum := checksum(pkt[l.innerIphAt:l.innerIphAt+ipv4HeaderLen], 0); csum != 0xffff {
 		t.Errorf("inner ipv4 header checksum is invalid")
+	}
+}
+
+// Test_tunnelGRO_udpHeader checks the header that describes a coalesced group of
+// encapsulated UDP datagrams, which differs from TCP's in the GSO type, in the
+// checksum offset, and in the inner length field it has to rewrite.
+func Test_tunnelGRO_udpHeader(t *testing.T) {
+	f := newTnlFixture(false, false)
+	f.proto = unix.IPPROTO_UDP
+	var pkts [][]byte
+	for i := 0; i < 4; i++ {
+		pkts = append(pkts, f.pkt(0, bytes.Repeat([]byte{byte(i)}, 100), 0))
+	}
+	bufs, hdrs, toWrite, _ := runTnlGRO(t, pkts)
+	if len(toWrite) != 1 {
+		t.Fatalf("handleGRO wrote %d packets, want 1", len(toWrite))
+	}
+	var hdr virtioNetHdrTnl
+	if err := hdr.decode(hdrs[toWrite[0]]); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	l, _, ok := parseTunnel(pkts[0])
+	if !ok {
+		t.Fatal("parseTunnel rejected a packet it should accept")
+	}
+	if l.protocol != unix.IPPROTO_UDP {
+		t.Fatalf("parseTunnel protocol = %d, want UDP", l.protocol)
+	}
+	// udp_gro_complete() marks the result GSO_UDP_L4 whatever the inner address
+	// family; the tunnel bit describes the outer one.
+	if want := uint8(unix.VIRTIO_NET_HDR_GSO_UDP_L4) | virtioNetHdrGSOUDPTunnelIPv4; hdr.gsoType != want {
+		t.Errorf("gsoType = %#x, want %#x", hdr.gsoType, want)
+	}
+	if int(hdr.csumOffset) != 6 {
+		t.Errorf("csumOffset = %d, want 6 (offsetof(udphdr, check))", hdr.csumOffset)
+	}
+	if int(hdr.csumStart) != l.transportAt {
+		t.Errorf("csumStart = %d, want %d", hdr.csumStart, l.transportAt)
+	}
+	// gsoSize counts the payload only. __udp_gso_segment() pulls the UDP header
+	// before segmenting, so that header belongs to what every segment duplicates
+	// rather than to what gsoSize measures.
+	if int(hdr.gsoSize) != 100 {
+		t.Errorf("gsoSize = %d, want 100 (payload only)", hdr.gsoSize)
+	}
+	if int(hdr.hdrLen) != l.transportAt+l.transportLen {
+		t.Errorf("hdrLen = %d, want %d", hdr.hdrLen, l.transportAt+l.transportLen)
+	}
+	pkt := bufs[toWrite[0]][16:]
+	// udp4_gro_complete() does udp_set_len(uh, skb->len - nhoff), so the template
+	// describes the whole group and the kernel rewrites it per segment.
+	if got := binary.BigEndian.Uint16(pkt[l.transportAt+4:]); int(got) != len(pkt)-l.transportAt {
+		t.Errorf("inner udp len = %d, want %d", got, len(pkt)-l.transportAt)
+	}
+	// The preloaded value is ~udp_v4_check() over the whole group, which is what
+	// a partial checksum at csum_start asks the kernel to complete.
+	psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_UDP, f.innerSrc, f.innerDst, uint16(len(pkt)-l.innerIphAt-l.innerIphLen))
+	if got, want := binary.BigEndian.Uint16(pkt[l.transportAt+6:]), checksum([]byte{}, psum); got != want {
+		t.Errorf("preloaded inner udp checksum = %#x, want %#x", got, want)
+	}
+}
+
+// Test_tunnelGRO_udpUnchecked covers a datagram sent with a zero UDP checksum,
+// which udp_rcv() accepts unchecked. It still coalesces, and the emitted header
+// leaves the checksum zero rather than preloading a pseudo-header sum, the way
+// udp4_gro_complete() leaves an unchecked header alone.
+func Test_tunnelGRO_udpUnchecked(t *testing.T) {
+	f := newTnlFixture(false, false)
+	f.proto = unix.IPPROTO_UDP
+	f.innerZeroCSum = true
+	var pkts [][]byte
+	for i := 0; i < 3; i++ {
+		pkts = append(pkts, f.pkt(0, bytes.Repeat([]byte{byte(i)}, 200), 0))
+	}
+	bufs, hdrs, toWrite, table := runTnlGRO(t, pkts)
+	if len(toWrite) != 1 {
+		t.Fatalf("handleGRO wrote %d packets, want 1", len(toWrite))
+	}
+	var hdr virtioNetHdrTnl
+	if err := hdr.decode(hdrs[toWrite[0]]); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if hdr.gsoType&virtioNetHdrGSOUDPTunnel == 0 {
+		t.Errorf("unchecked group was not described as tunnel GSO (gsoType %#x)", hdr.gsoType)
+	}
+	l, _, _ := parseTunnel(pkts[0])
+	pkt := bufs[toWrite[0]][16:]
+	if got := binary.BigEndian.Uint16(pkt[l.transportAt+6:]); got != 0 {
+		t.Errorf("inner udp checksum = %#x, want 0: unchecked stays unchecked", got)
+	}
+	if table.stats.InvalidCSum != 0 {
+		t.Errorf("InvalidCSum = %d, want 0", table.stats.InvalidCSum)
+	}
+}
+
+// Test_tunnelGRO_udpBadChecksum covers the fallback: a datagram whose inner
+// checksum does not validate is not one we can vouch for, so it is offered to
+// the plain UDP path rather than described as tunnel GSO and dropped from every
+// coalescing path.
+func Test_tunnelGRO_udpBadChecksum(t *testing.T) {
+	f := newTnlFixture(false, false)
+	f.proto = unix.IPPROTO_UDP
+	var pkts [][]byte
+	for i := 0; i < 3; i++ {
+		p := f.pkt(0, bytes.Repeat([]byte{byte(i)}, 200), 0)
+		l, _, ok := parseTunnel(p)
+		if !ok {
+			t.Fatal("parseTunnel rejected a packet it should accept")
+		}
+		// Corrupt the inner checksum, then repair the encapsulating one, which
+		// covers the whole frame: only the inner validation may reject this.
+		p[l.transportAt+6] ^= 0xff
+		binary.BigEndian.PutUint16(p[l.outerUdpAt+6:], 0)
+		psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_UDP, f.outerSrc, f.outerDst, uint16(len(p)-l.outerUdpAt))
+		csum := ^checksum(p[l.outerUdpAt:], psum)
+		if csum == 0 {
+			csum = 0xffff
+		}
+		binary.BigEndian.PutUint16(p[l.outerUdpAt+6:], csum)
+		pkts = append(pkts, p)
+	}
+	_, hdrs, toWrite, table := runTnlGRO(t, pkts)
+	if len(toWrite) != 1 {
+		t.Fatalf("handleGRO wrote %d packets, want 1 (plain UDP GRO must still coalesce them)", len(toWrite))
+	}
+	var hdr virtioNetHdrTnl
+	if err := hdr.decode(hdrs[toWrite[0]]); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if hdr.gsoType&virtioNetHdrGSOUDPTunnel != 0 {
+		t.Errorf("a group we cannot vouch for was described as tunnel GSO (gsoType %#x)", hdr.gsoType)
+	}
+	if got := table.stats.NotTunnel; got != 3 {
+		t.Errorf("NotTunnel = %d, want 3", got)
+	}
+}
+
+// Test_tunnelGRO_udpUnequalSizes covers the rule udp_gro_receive() applies to UDP
+// and not to TCP: nothing may follow a short segment, and UDP has no sequence
+// number with which to prepend.
+func Test_tunnelGRO_udpUnequalSizes(t *testing.T) {
+	f := newTnlFixture(false, false)
+	f.proto = unix.IPPROTO_UDP
+	pkts := [][]byte{
+		f.pkt(0, bytes.Repeat([]byte{1}, 200), 0),
+		f.pkt(0, bytes.Repeat([]byte{2}, 100), 0), // a short tail ends the group
+		f.pkt(0, bytes.Repeat([]byte{3}, 200), 0),
+	}
+	_, _, toWrite, table := runTnlGRO(t, pkts)
+	if len(toWrite) != 2 {
+		t.Fatalf("handleGRO wrote %d packets, want 2", len(toWrite))
+	}
+	if table.stats.Merged != 1 {
+		t.Errorf("Merged = %d, want 1", table.stats.Merged)
 	}
 }
 
@@ -554,6 +738,12 @@ func Fuzz_tunnelGRO(f *testing.F) {
 	for i := range seeds {
 		seeds[i] = fx.pkt(1000+uint32(i*100), bytes.Repeat([]byte{byte(i)}, 100), tcpFlagACK)
 	}
+	// Two of the four seeds carry UDP instead, so executions start inside the
+	// inner-UDP path rather than reaching it only by mutating a protocol byte.
+	fxUdp := newTnlFixture(false, false)
+	fxUdp.proto = unix.IPPROTO_UDP
+	seeds[2] = fxUdp.pkt(0, bytes.Repeat([]byte{2}, 100), 0)
+	seeds[3] = fxUdp.pkt(0, bytes.Repeat([]byte{3}, 100), 0)
 	// Reused across executions: allocating 128 maximum size buffers per
 	// execution costs more than the code under test.
 	outBufs := make([][]byte, 128)
@@ -571,9 +761,17 @@ func Fuzz_tunnelGRO(f *testing.F) {
 				return
 			}
 		}
-		if which%2 == 1 {
+		switch {
+		case which%4 == 1:
 			fx6 := newTnlFixture(true, true)
 			pkts[0] = fx6.pkt(1000, []byte{1}, tcpFlagACK)
+		case which%4 == 2:
+			pkts[0] = fxUdp.pkt(0, bytes.Repeat([]byte{1}, 1472), 0)
+		case which%4 == 3:
+			fxU6 := newTnlFixture(false, true)
+			fxU6.proto = unix.IPPROTO_UDP
+			fxU6.innerZeroCSum = true
+			pkts[0] = fxU6.pkt(0, []byte{1}, 0)
 		}
 		bufs, offset := tnlBufs(pkts)
 		hdrs := tnlHdrScratch(len(bufs))

@@ -13,16 +13,23 @@ import (
  *
  * A packet that arrives off the wire encapsulated by a UDP tunnel is, from the
  * point of view of the plain GRO tables, a single UDP datagram: the outer UDP
- * header bounds the coalescing, so a batch of N encapsulated TCP segments is
+ * header bounds the coalescing, so a batch of N encapsulated segments is
  * written to the TUN device as one GSO_UDP_L4 skb whose segments are the outer
  * datagrams. The kernel then decapsulates each datagram separately, producing N
- * inner skbs, and the TCP stack has to reassemble them.
+ * inner skbs, and the inner stack has to reassemble them.
  *
  * The tunnel GSO format the kernel accepts on write describes the *inner*
  * packet instead, so N encapsulated segments become one write, one outer GSO
  * skb, and one inner GSO skb after vxlan_rcv() has stripped the encapsulation.
- * This file recognises the encapsulated packets, coalesces them on their inner
- * TCP sequence numbers, and emits the header that describes the result.
+ * This file recognises the encapsulated packets, coalesces them, and emits the
+ * header that describes the result.
+ *
+ * The inner transport may be TCP or UDP. TCP segments are merged on their inner
+ * sequence numbers, the way the kernel merges them in tcp_gro_receive(). UDP
+ * datagrams carry no sequence numbers, so they are merged on the weaker rule
+ * udp_gro_receive() uses: same inner flow, identical segment size, and nothing
+ * smaller already at the tail. The encoding emitted for each is the one the
+ * kernel itself produces in udp4_gro_complete() and tcp_gro_complete().
  */
 
 const (
@@ -63,7 +70,7 @@ func isVxlanPort(port uint16) bool {
 // layout of its headers along with the tunnel's VNI. Only the encapsulation
 // that the kernel's ingress tunnel GSO path understands is accepted: a plain,
 // non-GPE VxLAN header carrying an untagged IPv4 or IPv6 packet whose transport
-// is TCP. Anything else reports false and is left to the plain GRO path.
+// is TCP or UDP. Anything else reports false and is left to the plain GRO path.
 func parseTunnel(b []byte) (gsoLayout, uint32, bool) {
 	var l gsoLayout
 	if len(b) < ipv4HeaderLen {
@@ -86,7 +93,9 @@ func parseTunnel(b []byte) (gsoLayout, uint32, bool) {
 	}
 	l.outerIphAt = 0
 	l.outerUdpAt = l.outerIphLen
-	if len(b) < l.outerUdpAt+udphLen+vxlanLen+ethHdrLen+ipv4HeaderLen+20 {
+	// Up to the inner IP header plus the smallest transport header we accept.
+	// The transport header itself is bounded exactly once its protocol is known.
+	if len(b) < l.outerUdpAt+udphLen+vxlanLen+ethHdrLen+ipv4HeaderLen+udphLen {
 		return l, 0, false
 	}
 	if !isVxlanPort(binary.BigEndian.Uint16(b[l.outerUdpAt+2:])) {
@@ -107,25 +116,41 @@ func parseTunnel(b []byte) (gsoLayout, uint32, bool) {
 		return l, 0, false
 	}
 	l.innerIphAt = l.innerEthAt + ethHdrLen
+	var innerProto uint8
+	if l.innerIsV6 && l.innerIphAt+ipv6HeaderLen > len(b) {
+		return l, 0, false
+	}
 	if l.innerIsV6 {
-		if b[l.innerIphAt]>>4 != 6 || b[l.innerIphAt+6] != unix.IPPROTO_TCP {
+		if b[l.innerIphAt]>>4 != 6 {
 			return l, 0, false
 		}
+		innerProto = b[l.innerIphAt+6]
 		l.innerIphLen = ipv6HeaderLen
 	} else {
-		if b[l.innerIphAt]>>4 != 4 || b[l.innerIphAt]&0x0F != 5 || b[l.innerIphAt+9] != unix.IPPROTO_TCP {
+		if b[l.innerIphAt]>>4 != 4 || b[l.innerIphAt]&0x0F != 5 {
 			return l, 0, false
 		}
+		innerProto = b[l.innerIphAt+9]
 		l.innerIphLen = ipv4HeaderLen
 	}
+	if innerProto != unix.IPPROTO_TCP && innerProto != unix.IPPROTO_UDP {
+		return l, 0, false
+	}
+	l.protocol = innerProto
+	// Both transports keep their checksum where the kernel's csum_offset
+	// expects it: tcp_gro_complete() and udp_gro_complete() both point
+	// csum_start at the transport header, at offsetof(udphdr, check) for UDP
+	// and offsetof(tcphdr, check) for TCP.
+	l.csumOffset = 16
+	if innerProto == unix.IPPROTO_UDP {
+		l.csumOffset = 6
+	}
 	l.transportAt = l.innerIphAt + l.innerIphLen
-	transportLen, err := transportHeaderLen(b, l.transportAt, unix.IPPROTO_TCP)
+	transportLen, err := transportHeaderLen(b, l.transportAt, l.protocol)
 	if err != nil {
 		return l, 0, false
 	}
 	l.transportLen = transportLen
-	l.csumOffset = 16
-	l.protocol = unix.IPPROTO_TCP
 	return l, vni, true
 }
 
@@ -172,11 +197,11 @@ func newTunnelFlowKey(pkt []byte, l gsoLayout, vni uint32) tunnelFlowKey {
 // evaluation across a vector of packets.
 type tunnelGROItem struct {
 	key       tunnelFlowKey
-	bufsIndex uint16 // the index into the original bufs slice
-	numMerged uint16 // the number of packets merged into this item
-	gsoSize   uint16 // inner payload size
-	sentSeq   uint32 // the inner TCP sequence number of the first segment
-	pshSet    bool
+	bufsIndex uint16    // the index into the original bufs slice
+	numMerged uint16    // the number of packets merged into this item
+	gsoSize   uint16    // inner payload size
+	sentSeq   uint32    // inner TCP sequence number of the first segment; unused for UDP
+	pshSet    bool      // unused for UDP, which has no flags
 	l         gsoLayout // the header layout of the packet that heads the group
 }
 
@@ -192,7 +217,7 @@ type tunnelGROTable struct {
 // GSO, so that a fallback to plain UDP GRO is observable rather than silent.
 type TunnelGROStats struct {
 	Packets      uint64 // encapsulated packets seen
-	Parsed       uint64 // of those, understood as VxLAN carrying inner TCP
+	Parsed       uint64 // of those, understood as VxLAN carrying inner TCP or UDP
 	NotTunnel    uint64 // outer UDP on a tunnel port, but not understood
 	Merged       uint64 // packets merged into an existing group
 	NewGroup     uint64 // packets that started a group
@@ -202,7 +227,7 @@ type TunnelGROStats struct {
 	TunnelFlags  uint64 // rejected: tunnel header flags differed
 	PSH          uint64 // rejected: a PSH flag ended the group
 	GsoSize      uint64 // rejected: segment sizes were not mergeable
-	InvalidCSum  uint64 // rejected: inner TCP checksum did not validate
+	InvalidCSum  uint64 // rejected: inner transport checksum did not validate
 	Capacity     uint64 // rejected: the group would not fit in its buffer
 }
 
@@ -295,8 +320,9 @@ const (
 )
 
 // tunnelPacketsCanCoalesce evaluates if pkt can be coalesced with the packet
-// described by item, following the same rules as tcpPacketsCanCoalesce but
-// against the inner transport header.
+// described by item, following the rules tcpPacketsCanCoalesce and
+// udpPacketsCanCoalesce apply to a plain packet, but against the *inner* transport
+// header.
 func tunnelPacketsCanCoalesce(pkt []byte, l gsoLayout, gsoSize uint16, seq uint32, pshSet bool, item tunnelGROItem, bufs [][]byte, offset int) (canCoalesce, tunnelRejectReason) {
 	pktTarget := bufs[item.bufsIndex][offset:]
 	if item.l != l {
@@ -309,6 +335,18 @@ func tunnelPacketsCanCoalesce(pkt []byte, l gsoLayout, gsoSize uint16, seq uint3
 	}
 	if pkt[l.vxlanAt] != pktTarget[item.l.vxlanAt] {
 		return coalesceUnavailable, tunnelRejectTunnelFlags
+	}
+	if l.protocol == unix.IPPROTO_UDP {
+		// udp_gro_receive() appends only: a UDP datagram carries no sequence
+		// number that would place it relative to the ones already grouped.
+		if len(pktTarget[l.transportAt+l.transportLen:])%int(item.gsoSize) != 0 {
+			// A smaller than gsoSize packet has been appended previously.
+			return coalesceUnavailable, tunnelRejectGsoSize
+		}
+		if gsoSize > item.gsoSize {
+			return coalesceUnavailable, tunnelRejectGsoSize
+		}
+		return coalesceAppend, tunnelRejectNone
 	}
 	// seq adjacency, on the inner sequence number
 	lhsLen := uint32(item.gsoSize) + uint32(item.numMerged)*uint32(item.gsoSize)
@@ -342,6 +380,18 @@ func tunnelPacketsCanCoalesce(pkt []byte, l gsoLayout, gsoSize uint16, seq uint3
 	return coalesceUnavailable, tunnelRejectSeq
 }
 
+// innerChecksumIsValid validates the checksum of the encapsulated transport
+// header. A zero UDP checksum over IPv4 means "unchecked", which udp_rcv()
+// accepts without validating, so it is accepted here too; over IPv6 a UDP
+// checksum is mandatory and zero is not.
+func innerChecksumIsValid(pkt []byte, l gsoLayout) bool {
+	if l.protocol == unix.IPPROTO_UDP && !l.innerIsV6 &&
+		binary.BigEndian.Uint16(pkt[l.transportAt+6:]) == 0 {
+		return true
+	}
+	return checksumValidAt(pkt, l.innerIphAt, l.innerIphLen, l.protocol, l.innerIsV6)
+}
+
 // coalesceTunnelPackets attempts to coalesce pkt with the packet described by
 // item, and returns the outcome. As with coalesceTCPPackets, a prepend swaps
 // buf elements, because the index of item is already being tracked for writing.
@@ -353,15 +403,19 @@ func coalesceTunnelPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoS
 		// The kernel describes the coalesced packet with 16 bit lengths.
 		return coalesceInsufficientCap
 	}
-	// The inner TCP checksum of every segment has to be valid, since the kernel
-	// hands the coalesced inner packet to the socket as one unit.
-	if item.numMerged == 0 {
-		if !checksumValidAt(bufs[item.bufsIndex][offset:], item.l.innerIphAt, item.l.innerIphLen, unix.IPPROTO_TCP, item.l.innerIsV6) {
-			return coalesceItemInvalidCSum
+	// The inner transport checksum of every segment has to be valid, since the
+	// kernel hands the coalesced inner packet to the socket as one unit. UDP was
+	// already validated in tunnelGRO, which is where it can be tested without
+	// first paying for a merge attempt.
+	if l.protocol != unix.IPPROTO_UDP {
+		if item.numMerged == 0 {
+			if !innerChecksumIsValid(bufs[item.bufsIndex][offset:], item.l) {
+				return coalesceItemInvalidCSum
+			}
 		}
-	}
-	if !checksumValidAt(pkt, l.innerIphAt, l.innerIphLen, unix.IPPROTO_TCP, l.innerIsV6) {
-		return coalescePktInvalidCSum
+		if !innerChecksumIsValid(pkt, l) {
+			return coalescePktInvalidCSum
+		}
 	}
 	if mode == coalescePrepend {
 		if cap(pkt)-offset < coalescedLen {
@@ -421,9 +475,24 @@ func tunnelGRO(bufs [][]byte, offset, pktI int, table *tunnelGROTable) groResult
 	if gsoSize < 1 {
 		return groResultNoop
 	}
+	// UDP offers no sequence numbers to test first, so the checksum is the
+	// earliest meaningful condition, and it is the one that decides whether we
+	// can vouch for the group at all. Refuse the packet here rather than mid
+	// merge, so that an encapsulated datagram we cannot vouch for still reaches
+	// the plain UDP path and is coalesced as opaque payload.
+	if l.protocol == unix.IPPROTO_UDP && !innerChecksumIsValid(pkt, l) {
+		table.stats.NotTunnel++
+		return groResultNoop
+	}
 	table.stats.Parsed++
-	seq := binary.BigEndian.Uint32(pkt[l.transportAt+4:])
-	pshSet := pkt[l.transportAt+tcpFlagsOffset]&tcpFlagPSH != 0
+	// A UDP header is only 8 bytes, so reading a TCP sequence number and flags
+	// out of it would run past the header into the payload.
+	var seq uint32
+	var pshSet bool
+	if l.protocol == unix.IPPROTO_TCP {
+		seq = binary.BigEndian.Uint32(pkt[l.transportAt+4:])
+		pshSet = pkt[l.transportAt+tcpFlagsOffset]&tcpFlagPSH != 0
+	}
 	key := newTunnelFlowKey(pkt, l, vni)
 	items, existing := table.lookupOrInsert(key, l, pktI, gsoSize, seq, pshSet)
 	if !existing {
@@ -499,6 +568,13 @@ func applyTunnelCoalesceAccounting(bufs [][]byte, offset int, table *tunnelGROTa
 			if l.innerIsV6 {
 				gsoType = unix.VIRTIO_NET_HDR_GSO_TCPV6
 			}
+			if l.protocol == unix.IPPROTO_UDP {
+				// udp_gro_complete() marks the result GSO_UDP_L4 whatever
+				// the inner address family, and virtio_net_hdr_tnl_to_skb()
+				// then reads the inner version from inner_nh_offset rather
+				// than from the gso type, since for USO the type cannot say.
+				gsoType = unix.VIRTIO_NET_HDR_GSO_UDP_L4
+			}
 			if l.outerIsV6 {
 				tunnelType = virtioNetHdrGSOUDPTunnelIPv6
 			}
@@ -529,18 +605,35 @@ func applyTunnelCoalesceAccounting(bufs [][]byte, offset int, table *tunnelGROTa
 				pkt[l.innerIphAt+10], pkt[l.innerIphAt+11] = 0, 0
 			}
 			setIPLen(pkt, l.innerIphAt, l.innerIphLen, len(pkt)-l.innerIphAt, 0, l.innerIsV6)
-			// The inner TCP checksum becomes a partial checksum over the whole
-			// coalesced group, which the kernel completes per segment.
+			if l.protocol == unix.IPPROTO_UDP {
+				// udp4_gro_complete() does udp_set_len(uh, skb->len - nhoff),
+				// so the template describes the whole coalesced datagram and
+				// __skb_udp_tunnel_segment() rewrites the length per segment.
+				binary.BigEndian.PutUint16(pkt[l.transportAt+4:], uint16(len(pkt)-l.transportAt))
+			}
+			// The inner transport checksum becomes a partial checksum over the
+			// whole coalesced group, which the kernel completes per segment.
 			srcAddrAt := offset + l.innerIphAt + ipv4SrcAddrOffset
 			addrLen := 4
 			if l.innerIsV6 {
 				srcAddrAt = offset + l.innerIphAt + ipv6SrcAddrOffset
 				addrLen = 16
 			}
-			srcAddr := bufs[item.bufsIndex][srcAddrAt : srcAddrAt+addrLen]
-			dstAddr := bufs[item.bufsIndex][srcAddrAt+addrLen : srcAddrAt+addrLen*2]
-			psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_TCP, srcAddr, dstAddr, uint16(len(pkt)-l.innerIphAt-l.innerIphLen))
-			binary.BigEndian.PutUint16(pkt[l.transportAt+l.csumOffset:], checksum([]byte{}, psum))
+			// udp4_gro_complete() preloads ~udp_v4_check() only when the header
+			// carried a checksum; an unchecked one stays zero and the kernel
+			// completes a full checksum per segment from the partial offset.
+			// The decision is taken on the group template, which is what the
+			// emitted header describes.
+			unchecked := l.protocol == unix.IPPROTO_UDP && !l.innerIsV6 &&
+				binary.BigEndian.Uint16(pkt[l.transportAt+l.csumOffset:]) == 0
+			if unchecked {
+				binary.BigEndian.PutUint16(pkt[l.transportAt+l.csumOffset:], 0)
+			} else {
+				srcAddr := bufs[item.bufsIndex][srcAddrAt : srcAddrAt+addrLen]
+				dstAddr := bufs[item.bufsIndex][srcAddrAt+addrLen : srcAddrAt+addrLen*2]
+				psum := pseudoHeaderChecksumNoFold(l.protocol, srcAddr, dstAddr, uint16(len(pkt)-l.innerIphAt-l.innerIphLen))
+				binary.BigEndian.PutUint16(pkt[l.transportAt+l.csumOffset:], checksum([]byte{}, psum))
+			}
 			if err := hdr.encode(store.tnlAt(int(item.bufsIndex))); err != nil {
 				return err
 			}

@@ -855,10 +855,11 @@ const (
 )
 
 // minTnlLen is the smallest packet that could hold an IPv4 tunnel header, a
-// VxLAN header, an Ethernet header, an IPv4 header and a TCP header. IPv6
-// outer headers are larger still, but this is only a first filter: parseTunnel
-// does the exact bounds checking.
-const minTnlLen = ipv4HeaderLen + udphLen + vxlanLen + ethHdrLen + ipv4HeaderLen + 20
+// VxLAN header, an Ethernet header, an IPv4 header and a transport header. The
+// smallest transport we accept is UDP's; a TCP header is bounded exactly by
+// transportHeaderLen. IPv6 outer headers are larger still, but this is only a
+// first filter: parseTunnel does the exact bounds checking.
+const minTnlLen = ipv4HeaderLen + udphLen + vxlanLen + ethHdrLen + ipv4HeaderLen + udphLen
 
 func packetIsGROCandidate(b []byte, canUDPGRO, canTunnelGRO bool) groCandidateType {
 	if len(b) < 28 {
