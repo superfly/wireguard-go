@@ -29,8 +29,13 @@ const (
 	// maxPktLen is the largest packet the kernel will hand us: the payload of a
 	// GSO packet is bounded by the largest possible datagram, which a UDP tunnel
 	// then wraps in its own headers.
-	maxPktLen      = 65535
-	maxTnlOverhead = ipv6HeaderLen + udphLen + vxlanLen
+	maxPktLen = 65535
+	// maxTnlOverhead bounds what a tunnel wraps around that datagram: the outer
+	// IP and UDP headers, plus whatever the tunnel itself puts ahead of the
+	// encapsulated packet, an Ethernet header included. It is a fixed generous
+	// allowance rather than the size of one particular tunnel, because the read
+	// buffer has to be sized before we know which tunnel, if any, is in use.
+	maxTnlOverhead = ipv6HeaderLen + udphLen + 32
 )
 
 type NativeTun struct {
@@ -60,10 +65,10 @@ type NativeTun struct {
 	toWrite     []int
 	tcpGROTable *tcpGROTable
 	udpGROTable *udpGROTable
-	// tunnelGROTable coalesces packets encapsulated by a UDP tunnel. It is only
+	// vxlanGROTable coalesces packets encapsulated by a UDP tunnel. It is only
 	// consulted when the kernel accepts a tunnel GSO header, which is when
 	// vnetHdrSize is virtioNetHdrTnlLen.
-	tunnelGROTable *tunnelGROTable
+	vxlanGROTable *vxlanGROTable
 	// gsoHdrs holds the virtio net header of each packet in a batch, rather
 	// than in the space in front of the packet, because that space is only
 	// MessageTransportOffsetContent bytes wide and a tunnel header is wider.
@@ -355,7 +360,7 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	defer func() {
 		tun.tcpGROTable.reset()
 		tun.udpGROTable.reset()
-		tun.tunnelGROTable.reset()
+		tun.vxlanGROTable.reset()
 		tun.writeOpMu.Unlock()
 	}()
 	var (
@@ -370,12 +375,12 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.toWrite = tun.toWrite[:0]
 	if tun.vnetHdr {
 		var hdrs [][]byte
-		var tnlTable *tunnelGROTable
+		var vxlanTable *vxlanGROTable
 		if tnlHdrs {
 			hdrs = tun.groHdrScratch(len(bufs))
-			tnlTable = tun.tunnelGROTable
+			vxlanTable = tun.vxlanGROTable
 		}
-		err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, tnlTable, tun.udpGSO, hdrs, &tun.toWrite)
+		err := handleGRO(bufs, offset, tun.tcpGROTable, tun.udpGROTable, vxlanTable, tun.udpGSO, hdrs, &tun.toWrite)
 		if err != nil {
 			return 0, err
 		}
@@ -458,15 +463,15 @@ func (tun *NativeTun) groHdrScratch(n int) [][]byte {
 	return tun.gsoHdrViews[:n]
 }
 
-// TunnelGROStats reports why encapsulated packets were, or were not, coalesced
+// VxlanGROStats reports why encapsulated packets were, or were not, coalesced
 // as tunnel GSO.
-func (tun *NativeTun) TunnelGROStats() TunnelGROStats {
+func (tun *NativeTun) VxlanGROStats() VxlanGROStats {
 	tun.writeOpMu.Lock()
 	defer tun.writeOpMu.Unlock()
-	if tun.tunnelGROTable == nil {
-		return TunnelGROStats{}
+	if tun.vxlanGROTable == nil {
+		return VxlanGROStats{}
 	}
-	return tun.tunnelGROTable.stats
+	return tun.vxlanGROTable.stats
 }
 
 // handleVirtioRead splits in into bufs, leaving offset bytes at the front of
@@ -892,7 +897,7 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		vnetHdrSize:             virtioNetHdrLen,
 		tcpGROTable:             newTCPGROTable(),
 		udpGROTable:             newUDPGROTable(),
-		tunnelGROTable:          newTunnelGROTable(),
+		vxlanGROTable:           newVxlanGROTable(),
 		toWrite:                 make([]int, 0, conn.IdealBatchSize),
 	}
 
@@ -944,14 +949,14 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 	}
 	file := os.NewFile(uintptr(fd), "/dev/tun")
 	tun := &NativeTun{
-		tunFile:        file,
-		events:         make(chan Event, 5),
-		errors:         make(chan error, 5),
-		vnetHdrSize:    virtioNetHdrLen,
-		tcpGROTable:    newTCPGROTable(),
-		udpGROTable:    newUDPGROTable(),
-		tunnelGROTable: newTunnelGROTable(),
-		toWrite:        make([]int, 0, conn.IdealBatchSize),
+		tunFile:       file,
+		events:        make(chan Event, 5),
+		errors:        make(chan error, 5),
+		vnetHdrSize:   virtioNetHdrLen,
+		tcpGROTable:   newTCPGROTable(),
+		udpGROTable:   newUDPGROTable(),
+		vxlanGROTable: newVxlanGROTable(),
+		toWrite:       make([]int, 0, conn.IdealBatchSize),
 	}
 	name, err := tun.Name()
 	if err != nil {

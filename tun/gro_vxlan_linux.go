@@ -5,12 +5,24 @@ package tun
 import (
 	"encoding/binary"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
 )
 
-/* Ingress tunnel GRO.
+/* Ingress VxLAN GRO.
+ *
+ * This path is specific to VxLAN, and to the ingress direction only. It has to
+ * be: recognising an encapsulated packet means guessing at a configuration we
+ * cannot see, since the kernel decapsulates on its own schedule and tells us
+ * nothing about the tunnel. The egress direction is generic by contrast,
+ * because there the kernel describes the encapsulation to us in the header.
+ * This path does nothing at all unless ENV_WG_TUN_GRO_VXLAN_PORTS names the
+ * port it should expect.
  *
  * A packet that arrives off the wire encapsulated by a UDP tunnel is, from the
  * point of view of the plain GRO tables, a single UDP datagram: the outer UDP
@@ -38,41 +50,80 @@ const (
 	ethTypeIPv4 = 0x0800
 	ethTypeIPv6 = 0x86dd
 
+	vxlanLen = 8 // the fixed part of a VxLAN or VxLAN-GPE header
+
 	vxlanFlagI         = 0x08      // the only VxLAN flag we accept; GPE sets others
 	maxTnlCoalescedLen = maxUint16 // the kernel's GSO size limit
+
+	// A VxLAN packet carries the tunnel header, an Ethernet header, an inner IP
+	// header and a transport header on top of the outer ones. The smallest
+	// transport we accept is UDP's; a TCP header is bounded exactly by
+	// transportHeaderLen. These are a first filter only: parseVxlan does the
+	// exact bounds checking.
+	minVxlan4Len = ipv4HeaderLen + udphLen + vxlanLen + ethHdrLen + ipv4HeaderLen + udphLen
+	minVxlan6Len = ipv6HeaderLen + udphLen + vxlanLen + ethHdrLen + ipv4HeaderLen + udphLen
 )
 
-// tunTunnelOuterThBias pads the outer transport offset we hand the kernel on
+// vxlanOuterThBias pads the outer transport offset we hand the kernel on
 // write. virtio_net_hdr_tnl_to_skb() validates outer_th_offset against
 // ETH_HLEN + the outer IP header, because a TAP device delivers an Ethernet
 // header first. IFF_TUN does not, so the offset we mean is always below the
 // bound the kernel enforces. ip_rcv_core() resets the transport header from the
 // IP header's IHL field before anything reads it, so the padded value only has
 // to satisfy the check.
-const tunTunnelOuterThBias = ethHdrLen
+const vxlanOuterThBias = ethHdrLen
 
-// vxlanUDPPorts are the UDP destination ports we will look for an encapsulated
-// packet on. The kernel binds its VxLAN sockets to a configured port and we
-// have no view of that configuration, so we recognise the registered defaults.
-// A tunnel running on some other port is still forwarded, just coalesced as
-// plain UDP.
-var vxlanUDPPorts = [...]uint16{4789, 8472, 4790}
+// ENV_WG_TUN_GRO_VXLAN_PORTS turns this path on, and picks the UDP destination
+// ports it looks for an encapsulated packet on. Nothing is coalesced as VxLAN
+// unless the variable names the port. We could guess at a default, but the
+// kernel binds its VxLAN sockets to a configured port and we have no view of
+// that configuration, so a guessed list would be wrong for exactly the tunnels
+// that need it. A tunnel on a port outside the set is still forwarded, just
+// coalesced as plain UDP. The egress tunnel offload is unaffected either way,
+// since there the kernel describes the encapsulation to us.
+const ENV_WG_TUN_GRO_VXLAN_PORTS = "WG_TUN_GRO_VXLAN_PORTS"
 
-func isVxlanPort(port uint16) bool {
-	for _, p := range vxlanUDPPorts {
-		if p == port {
-			return true
+// vxlanUDPPorts is read once, on first use, so that the environment is
+// consulted neither per packet nor per batch.
+var vxlanUDPPorts = sync.OnceValue(parseVxlanUDPPorts)
+
+// parseVxlanUDPPorts reads a comma separated list of port numbers. Entries that
+// are not a port number are ignored, so a variable that is unset, or holds
+// nothing usable, leaves the set empty: VxLAN GRO stays off until told which
+// port to work on.
+func parseVxlanUDPPorts() map[uint16]bool {
+	ports := make(map[uint16]bool)
+	for _, field := range strings.Split(os.Getenv(ENV_WG_TUN_GRO_VXLAN_PORTS), ",") {
+		port, err := strconv.ParseUint(strings.TrimSpace(field), 10, 16)
+		if err != nil || port == 0 {
+			continue
 		}
+		ports[uint16(port)] = true
 	}
-	return false
+	return ports
 }
 
-// parseTunnel parses a packet encapsulated by a UDP tunnel and returns the
+func isVxlanPort(port uint16) bool {
+	return vxlanUDPPorts()[port]
+}
+
+// isVxlan4GROCandidate and isVxlan6GROCandidate report whether b is an outer
+// IPv4 or IPv6 packet carrying VxLAN on a port we coalesce. The caller has
+// already established that the packet is UDP.
+func isVxlan4GROCandidate(b []byte) bool {
+	return len(b) >= minVxlan4Len && isVxlanPort(binary.BigEndian.Uint16(b[ipv4HeaderLen+2:]))
+}
+
+func isVxlan6GROCandidate(b []byte) bool {
+	return len(b) >= minVxlan6Len && isVxlanPort(binary.BigEndian.Uint16(b[ipv6HeaderLen+2:]))
+}
+
+// parseVxlan parses a packet encapsulated by a UDP tunnel and returns the
 // layout of its headers along with the tunnel's VNI. Only the encapsulation
 // that the kernel's ingress tunnel GSO path understands is accepted: a plain,
 // non-GPE VxLAN header carrying an untagged IPv4 or IPv6 packet whose transport
 // is TCP or UDP. Anything else reports false and is left to the plain GRO path.
-func parseTunnel(b []byte) (gsoLayout, uint32, bool) {
+func parseVxlan(b []byte) (gsoLayout, uint32, bool) {
 	var l gsoLayout
 	if len(b) < ipv4HeaderLen {
 		return l, 0, false
@@ -102,14 +153,14 @@ func parseTunnel(b []byte) (gsoLayout, uint32, bool) {
 	if !isVxlanPort(binary.BigEndian.Uint16(b[l.outerUdpAt+2:])) {
 		return l, 0, false
 	}
-	l.vxlanAt = l.outerUdpAt + udphLen
-	if b[l.vxlanAt]&^vxlanFlagI != 0 {
+	l.tunnelHdrAt = l.outerUdpAt + udphLen
+	if b[l.tunnelHdrAt]&^vxlanFlagI != 0 {
 		// Not plain VxLAN: the GPE flag, or a reserved bit that is set, means
 		// the encapsulated frame is not an Ethernet frame.
 		return l, 0, false
 	}
-	vni := binary.BigEndian.Uint32(b[l.vxlanAt+4:]) >> 8
-	l.innerEthAt = l.vxlanAt + vxlanLen
+	vni := binary.BigEndian.Uint32(b[l.tunnelHdrAt+4:]) >> 8
+	l.innerEthAt = l.tunnelHdrAt + vxlanLen
 	innerEthType := binary.BigEndian.Uint16(b[l.innerEthAt+12:])
 	l.innerIsV6 = innerEthType == ethTypeIPv6
 	if !l.innerIsV6 && innerEthType != ethTypeIPv4 {
@@ -157,9 +208,9 @@ func parseTunnel(b []byte) (gsoLayout, uint32, bool) {
 	return l, vni, true
 }
 
-// tunnelFlowKey identifies the flow an encapsulated packet belongs to, which is
+// vxlanFlowKey identifies the flow an encapsulated packet belongs to, which is
 // the outer flow, the tunnel, and the inner flow together.
-type tunnelFlowKey struct {
+type vxlanFlowKey struct {
 	outerSrc   [16]byte
 	outerDst   [16]byte
 	innerSrc   [16]byte
@@ -171,10 +222,10 @@ type tunnelFlowKey struct {
 	innerIsV6  bool
 }
 
-func newTunnelFlowKey(pkt []byte, l gsoLayout, vni uint32) tunnelFlowKey {
+func newVxlanFlowKey(pkt []byte, l gsoLayout, vni uint32) vxlanFlowKey {
 	// Every offset in the layout was found by parsing the packet, so the
 	// addresses the key is built from are within its bounds.
-	key := tunnelFlowKey{
+	key := vxlanFlowKey{
 		vni:       vni,
 		outerIsV6: l.outerIsV6,
 		innerIsV6: l.innerIsV6,
@@ -196,10 +247,10 @@ func newTunnelFlowKey(pkt []byte, l gsoLayout, vni uint32) tunnelFlowKey {
 	return key
 }
 
-// tunnelGROItem is the bookkeeping for one encapsulated packet during a GRO
+// vxlanGROItem is the bookkeeping for one encapsulated packet during a GRO
 // evaluation across a vector of packets.
-type tunnelGROItem struct {
-	key       tunnelFlowKey
+type vxlanGROItem struct {
+	key       vxlanFlowKey
 	bufsIndex uint16    // the index into the original bufs slice
 	numMerged uint16    // the number of packets merged into this item
 	gsoSize   uint16    // inner payload size
@@ -208,68 +259,68 @@ type tunnelGROItem struct {
 	l         gsoLayout // the header layout of the packet that heads the group
 }
 
-// tunnelGROTable holds flow and coalescing information for encapsulated
+// vxlanGROTable holds flow and coalescing information for encapsulated
 // packets.
-type tunnelGROTable struct {
-	itemsByFlow map[tunnelFlowKey][]tunnelGROItem
-	itemsPool   [][]tunnelGROItem
-	stats       TunnelGROStats
+type vxlanGROTable struct {
+	itemsByFlow map[vxlanFlowKey][]vxlanGROItem
+	itemsPool   [][]vxlanGROItem
+	stats       VxlanGROStats
 }
 
-// TunnelGROStats counts why encapsulated packets were not coalesced as tunnel
+// VxlanGROStats counts why encapsulated packets were not coalesced as tunnel
 // GSO, so that a fallback to plain UDP GRO is observable rather than silent.
-type TunnelGROStats struct {
+type VxlanGROStats struct {
 	Packets      uint64 // encapsulated packets seen
 	Parsed       uint64 // of those, understood as VxLAN carrying inner TCP or UDP
-	NotTunnel    uint64 // outer UDP on a tunnel port, but not understood
+	NotVxlan     uint64 // outer UDP on a tunnel port, but not understood
 	Merged       uint64 // packets merged into an existing group
 	NewGroup     uint64 // packets that started a group
 	Seq          uint64 // rejected: inner sequence numbers were not adjacent
 	Layout       uint64 // rejected: header lengths differed from the template
 	OuterHeaders uint64 // rejected: outer IP headers differed
-	TunnelFlags  uint64 // rejected: tunnel header flags differed
+	HeaderFlags  uint64 // rejected: tunnel header flags differed
 	PSH          uint64 // rejected: a PSH flag ended the group
 	GsoSize      uint64 // rejected: segment sizes were not mergeable
 	InvalidCSum  uint64 // rejected: inner transport checksum did not validate
 	Capacity     uint64 // rejected: the group would not fit in its buffer
 }
 
-func (s *TunnelGROStats) count(reason tunnelRejectReason) {
+func (s *VxlanGROStats) count(reason vxlanRejectReason) {
 	switch reason {
-	case tunnelRejectLayout:
+	case vxlanRejectLayout:
 		s.Layout++
-	case tunnelRejectOuterHeaders:
+	case vxlanRejectOuterHeaders:
 		s.OuterHeaders++
-	case tunnelRejectTunnelFlags:
-		s.TunnelFlags++
-	case tunnelRejectSeq:
+	case vxlanRejectFlags:
+		s.HeaderFlags++
+	case vxlanRejectSeq:
 		s.Seq++
-	case tunnelRejectPSH:
+	case vxlanRejectPSH:
 		s.PSH++
-	case tunnelRejectGsoSize:
+	case vxlanRejectGsoSize:
 		s.GsoSize++
 	default:
 	}
 }
 
-func newTunnelGROTable() *tunnelGROTable {
-	t := &tunnelGROTable{
-		itemsByFlow: make(map[tunnelFlowKey][]tunnelGROItem, conn.IdealBatchSize),
-		itemsPool:   make([][]tunnelGROItem, conn.IdealBatchSize),
+func newVxlanGROTable() *vxlanGROTable {
+	t := &vxlanGROTable{
+		itemsByFlow: make(map[vxlanFlowKey][]vxlanGROItem, conn.IdealBatchSize),
+		itemsPool:   make([][]vxlanGROItem, conn.IdealBatchSize),
 	}
 	for i := range t.itemsPool {
-		t.itemsPool[i] = make([]tunnelGROItem, 0, conn.IdealBatchSize)
+		t.itemsPool[i] = make([]vxlanGROItem, 0, conn.IdealBatchSize)
 	}
 	return t
 }
 
-func (t *tunnelGROTable) newItems() []tunnelGROItem {
-	var items []tunnelGROItem
+func (t *vxlanGROTable) newItems() []vxlanGROItem {
+	var items []vxlanGROItem
 	items, t.itemsPool = t.itemsPool[len(t.itemsPool)-1], t.itemsPool[:len(t.itemsPool)-1]
 	return items
 }
 
-func (t *tunnelGROTable) reset() {
+func (t *vxlanGROTable) reset() {
 	for k, items := range t.itemsByFlow {
 		items = items[:0]
 		t.itemsPool = append(t.itemsPool, items)
@@ -277,7 +328,7 @@ func (t *tunnelGROTable) reset() {
 	}
 }
 
-func (t *tunnelGROTable) lookupOrInsert(key tunnelFlowKey, l gsoLayout, bufsIndex int, gsoSize uint16, seq uint32, pshSet bool) ([]tunnelGROItem, bool) {
+func (t *vxlanGROTable) lookupOrInsert(key vxlanFlowKey, l gsoLayout, bufsIndex int, gsoSize uint16, seq uint32, pshSet bool) ([]vxlanGROItem, bool) {
 	items, ok := t.itemsByFlow[key]
 	if ok {
 		return items, ok
@@ -286,8 +337,8 @@ func (t *tunnelGROTable) lookupOrInsert(key tunnelFlowKey, l gsoLayout, bufsInde
 	return nil, false
 }
 
-func (t *tunnelGROTable) insert(key tunnelFlowKey, l gsoLayout, bufsIndex int, gsoSize uint16, seq uint32, pshSet bool) {
-	item := tunnelGROItem{
+func (t *vxlanGROTable) insert(key vxlanFlowKey, l gsoLayout, bufsIndex int, gsoSize uint16, seq uint32, pshSet bool) {
+	item := vxlanGROItem{
 		key:       key,
 		bufsIndex: uint16(bufsIndex),
 		gsoSize:   gsoSize,
@@ -303,84 +354,84 @@ func (t *tunnelGROTable) insert(key tunnelFlowKey, l gsoLayout, bufsIndex int, g
 	t.itemsByFlow[key] = append(items, item)
 }
 
-func (t *tunnelGROTable) updateAt(item tunnelGROItem, i int) {
+func (t *vxlanGROTable) updateAt(item vxlanGROItem, i int) {
 	items, _ := t.itemsByFlow[item.key]
 	items[i] = item
 }
 
-// tunnelRejectReason explains why an encapsulated packet could not join a
+// vxlanRejectReason explains why an encapsulated packet could not join a
 // group, so that the reason is countable rather than merely absent.
-type tunnelRejectReason uint8
+type vxlanRejectReason uint8
 
 const (
-	tunnelRejectNone tunnelRejectReason = iota
-	tunnelRejectLayout
-	tunnelRejectOuterHeaders
-	tunnelRejectTunnelFlags
-	tunnelRejectSeq
-	tunnelRejectPSH
-	tunnelRejectGsoSize
+	vxlanRejectNone vxlanRejectReason = iota
+	vxlanRejectLayout
+	vxlanRejectOuterHeaders
+	vxlanRejectFlags
+	vxlanRejectSeq
+	vxlanRejectPSH
+	vxlanRejectGsoSize
 )
 
-// tunnelPacketsCanCoalesce evaluates if pkt can be coalesced with the packet
+// vxlanPacketsCanCoalesce evaluates if pkt can be coalesced with the packet
 // described by item, following the rules tcpPacketsCanCoalesce and
 // udpPacketsCanCoalesce apply to a plain packet, but against the *inner* transport
 // header.
-func tunnelPacketsCanCoalesce(pkt []byte, l gsoLayout, gsoSize uint16, seq uint32, pshSet bool, item tunnelGROItem, bufs [][]byte, offset int) (canCoalesce, tunnelRejectReason) {
+func vxlanPacketsCanCoalesce(pkt []byte, l gsoLayout, gsoSize uint16, seq uint32, pshSet bool, item vxlanGROItem, bufs [][]byte, offset int) (canCoalesce, vxlanRejectReason) {
 	pktTarget := bufs[item.bufsIndex][offset:]
 	if item.l != l {
 		// The kernel describes every segment with the template's header length,
 		// so a group may only contain packets whose headers are the same size.
-		return coalesceUnavailable, tunnelRejectLayout
+		return coalesceUnavailable, vxlanRejectLayout
 	}
 	if !ipHeadersCanCoalesce(pkt, pktTarget) {
-		return coalesceUnavailable, tunnelRejectOuterHeaders
+		return coalesceUnavailable, vxlanRejectOuterHeaders
 	}
-	if pkt[l.vxlanAt] != pktTarget[item.l.vxlanAt] {
-		return coalesceUnavailable, tunnelRejectTunnelFlags
+	if pkt[l.tunnelHdrAt] != pktTarget[item.l.tunnelHdrAt] {
+		return coalesceUnavailable, vxlanRejectFlags
 	}
 	if l.protocol == unix.IPPROTO_UDP {
 		// udp_gro_receive() appends only: a UDP datagram carries no sequence
 		// number that would place it relative to the ones already grouped.
 		if len(pktTarget[l.transportAt+l.transportLen:])%int(item.gsoSize) != 0 {
 			// A smaller than gsoSize packet has been appended previously.
-			return coalesceUnavailable, tunnelRejectGsoSize
+			return coalesceUnavailable, vxlanRejectGsoSize
 		}
 		if gsoSize > item.gsoSize {
-			return coalesceUnavailable, tunnelRejectGsoSize
+			return coalesceUnavailable, vxlanRejectGsoSize
 		}
-		return coalesceAppend, tunnelRejectNone
+		return coalesceAppend, vxlanRejectNone
 	}
 	// seq adjacency, on the inner sequence number
 	lhsLen := uint32(item.gsoSize) + uint32(item.numMerged)*uint32(item.gsoSize)
 	if seq == item.sentSeq+lhsLen {
 		if item.pshSet {
 			// We cannot append to a segment that has the PSH flag set.
-			return coalesceUnavailable, tunnelRejectPSH
+			return coalesceUnavailable, vxlanRejectPSH
 		}
 		if len(pktTarget[l.transportAt+l.transportLen:])%int(item.gsoSize) != 0 {
 			// A smaller than gsoSize packet has been appended previously.
-			return coalesceUnavailable, tunnelRejectGsoSize
+			return coalesceUnavailable, vxlanRejectGsoSize
 		}
 		if gsoSize > item.gsoSize {
-			return coalesceUnavailable, tunnelRejectGsoSize
+			return coalesceUnavailable, vxlanRejectGsoSize
 		}
-		return coalesceAppend, tunnelRejectNone
+		return coalesceAppend, vxlanRejectNone
 	} else if seq+uint32(gsoSize) == item.sentSeq {
 		if pshSet || item.pshSet {
 			// A prepend replaces the header every segment is copied from, so a
 			// group whose last segment carries PSH would lose it.
-			return coalesceUnavailable, tunnelRejectPSH
+			return coalesceUnavailable, vxlanRejectPSH
 		}
 		if gsoSize < item.gsoSize {
-			return coalesceUnavailable, tunnelRejectGsoSize
+			return coalesceUnavailable, vxlanRejectGsoSize
 		}
 		if gsoSize > item.gsoSize && item.numMerged > 0 {
-			return coalesceUnavailable, tunnelRejectGsoSize
+			return coalesceUnavailable, vxlanRejectGsoSize
 		}
-		return coalescePrepend, tunnelRejectNone
+		return coalescePrepend, vxlanRejectNone
 	}
-	return coalesceUnavailable, tunnelRejectSeq
+	return coalesceUnavailable, vxlanRejectSeq
 }
 
 // innerChecksumIsValid validates the checksum of the encapsulated transport
@@ -395,10 +446,10 @@ func innerChecksumIsValid(pkt []byte, l gsoLayout) bool {
 	return checksumValidAt(pkt, l.innerIphAt, l.innerIphLen, l.protocol, l.innerIsV6)
 }
 
-// coalesceTunnelPackets attempts to coalesce pkt with the packet described by
+// coalesceVxlanPackets attempts to coalesce pkt with the packet described by
 // item, and returns the outcome. As with coalesceTCPPackets, a prepend swaps
 // buf elements, because the index of item is already being tracked for writing.
-func coalesceTunnelPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoSize uint16, seq uint32, pshSet bool, item *tunnelGROItem, bufs [][]byte, offset int) coalesceResult {
+func coalesceVxlanPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoSize uint16, seq uint32, pshSet bool, item *vxlanGROItem, bufs [][]byte, offset int) coalesceResult {
 	l := item.l
 	headersLen := l.transportAt + l.transportLen
 	coalescedLen := len(bufs[item.bufsIndex][offset:]) + len(pkt) - headersLen
@@ -409,7 +460,7 @@ func coalesceTunnelPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoS
 	// The inner transport checksum of every segment has to be valid, since the
 	// kernel hands the coalesced inner packet to the socket as one unit. TCP is
 	// checked here, where a merge is about to be paid for; UDP was already
-	// validated in tunnelGRO, which is where it can be tested for free.
+	// validated in vxlanGRO, which is where it can be tested for free.
 	if l.protocol == unix.IPPROTO_TCP {
 		if item.numMerged == 0 {
 			if !innerChecksumIsValid(bufs[item.bufsIndex][offset:], item.l) {
@@ -452,16 +503,16 @@ func coalesceTunnelPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoS
 	return coalesceSuccess
 }
 
-// tunnelGRO evaluates pkt as an encapsulated packet, coalescing it with an
+// vxlanGRO evaluates pkt as an encapsulated packet, coalescing it with an
 // existing group or starting a new one. groResultNoop means the packet is not
 // one we can describe as tunnel GSO, and the caller should offer it to the
 // plain UDP path instead.
-func tunnelGRO(bufs [][]byte, offset, pktI int, table *tunnelGROTable) groResult {
+func vxlanGRO(bufs [][]byte, offset, pktI int, table *vxlanGROTable) groResult {
 	pkt := bufs[pktI][offset:]
 	table.stats.Packets++
-	l, vni, ok := parseTunnel(pkt)
+	l, vni, ok := parseVxlan(pkt)
 	if !ok {
-		table.stats.NotTunnel++
+		table.stats.NotVxlan++
 		return groResultNoop
 	}
 	if len(pkt) > maxUint16 {
@@ -470,8 +521,8 @@ func tunnelGRO(bufs [][]byte, offset, pktI int, table *tunnelGROTable) groResult
 	}
 	// The packet has to be a complete, unfragmented datagram, both outside and
 	// in, in the same way udpGRO and tcpGRO require of a plain packet.
-	if !packetLengthsAreConsistent(pkt, l.outerIphAt, l.outerIphLen, l.outerIsV6) ||
-		!packetLengthsAreConsistent(pkt, l.innerIphAt, l.innerIphLen, l.innerIsV6) {
+	if !canCoalescePackets(pkt, l.outerIphAt, l.outerIphLen, l.outerIsV6) ||
+		!canCoalescePackets(pkt, l.innerIphAt, l.innerIphLen, l.innerIsV6) {
 		return groResultNoop
 	}
 	gsoSize := uint16(len(pkt) - l.transportAt - l.transportLen)
@@ -484,7 +535,7 @@ func tunnelGRO(bufs [][]byte, offset, pktI int, table *tunnelGROTable) groResult
 	// merge, so that an encapsulated datagram we cannot vouch for still reaches
 	// the plain UDP path and is coalesced as opaque payload.
 	if l.protocol == unix.IPPROTO_UDP && !innerChecksumIsValid(pkt, l) {
-		table.stats.NotTunnel++
+		table.stats.NotVxlan++
 		return groResultNoop
 	}
 	table.stats.Parsed++
@@ -496,19 +547,19 @@ func tunnelGRO(bufs [][]byte, offset, pktI int, table *tunnelGROTable) groResult
 		seq = binary.BigEndian.Uint32(pkt[l.transportAt+4:])
 		pshSet = pkt[l.transportAt+tcpFlagsOffset]&tcpFlagPSH != 0
 	}
-	key := newTunnelFlowKey(pkt, l, vni)
+	key := newVxlanFlowKey(pkt, l, vni)
 	items, existing := table.lookupOrInsert(key, l, pktI, gsoSize, seq, pshSet)
 	if !existing {
 		return groResultTableInsert
 	}
 	for i := range items {
 		item := items[i]
-		can, reason := tunnelPacketsCanCoalesce(pkt, l, gsoSize, seq, pshSet, item, bufs, offset)
+		can, reason := vxlanPacketsCanCoalesce(pkt, l, gsoSize, seq, pshSet, item, bufs, offset)
 		if can == coalesceUnavailable {
 			table.stats.count(reason)
 			continue
 		}
-		result := coalesceTunnelPackets(can, pkt, pktI, gsoSize, seq, pshSet, &item, bufs, offset)
+		result := coalesceVxlanPackets(can, pkt, pktI, gsoSize, seq, pshSet, &item, bufs, offset)
 		switch result {
 		case coalesceSuccess:
 			table.stats.Merged++
@@ -519,7 +570,7 @@ func tunnelGRO(bufs [][]byte, offset, pktI int, table *tunnelGROTable) groResult
 		case coalesceItemInvalidCSum, coalescePktInvalidCSum:
 			table.stats.InvalidCSum++
 		case coalescePSHEnding:
-			table.stats.count(tunnelRejectPSH)
+			table.stats.count(vxlanRejectPSH)
 		default:
 		}
 	}
@@ -527,10 +578,10 @@ func tunnelGRO(bufs [][]byte, offset, pktI int, table *tunnelGROTable) groResult
 	return groResultTableInsert
 }
 
-// packetLengthsAreConsistent reports whether the IP header at iphAt describes a
+// canCoalescePackets reports whether the IP header at iphAt describes a
 // packet that ends exactly at the end of pkt, and is not fragmented. iphAt is
 // relative to pkt.
-func packetLengthsAreConsistent(pkt []byte, iphAt, iphLen int, isV6 bool) bool {
+func canCoalescePackets(pkt []byte, iphAt, iphLen int, isV6 bool) bool {
 	if iphAt+iphLen > len(pkt) {
 		return false
 	}
@@ -552,10 +603,10 @@ func packetLengthsAreConsistent(pkt []byte, iphAt, iphLen int, isV6 bool) bool {
 	return int(binary.BigEndian.Uint16(hdr[2:])) == len(pkt)-iphAt
 }
 
-// applyTunnelCoalesceAccounting rewrites the packet that heads each coalesced
+// applyVxlanCoalesceAccounting rewrites the packet that heads each coalesced
 // group so that it describes the whole group, and stores the tunnel GSO header
 // that tells the kernel how to read it.
-func applyTunnelCoalesceAccounting(bufs [][]byte, offset int, table *tunnelGROTable, store *groHdrStore) error {
+func applyVxlanCoalesceAccounting(bufs [][]byte, offset int, table *vxlanGROTable, store *groHdrStore) error {
 	if table == nil {
 		return nil
 	}
@@ -599,7 +650,7 @@ func applyTunnelCoalesceAccounting(bufs [][]byte, offset int, table *tunnelGROTa
 					csumOffset: uint16(l.csumOffset),
 				},
 				// The kernel's bound includes an Ethernet header we do not have.
-				outerThOffset: uint16(l.outerUdpAt + tunTunnelOuterThBias),
+				outerThOffset: uint16(l.outerUdpAt + vxlanOuterThBias),
 				innerNhOffset: uint16(l.innerIphAt),
 			}
 			// The outer and inner IP headers both describe the whole coalesced

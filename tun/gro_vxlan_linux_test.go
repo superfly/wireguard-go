@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"os"
 	"strconv"
 	"testing"
 
@@ -13,6 +15,19 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 )
+
+// TestMain opts in to VxLAN GRO on the ports the fixtures encapsulate on. The
+// path is off unless the environment names a port, so without this every
+// encapsulated packet below would be classified as plain UDP and the tests
+// would pass for the wrong reason -- or, as they did before this was added,
+// report that nothing merged.
+func TestMain(m *testing.M) {
+	if err := os.Setenv(ENV_WG_TUN_GRO_VXLAN_PORTS, "4789,8472,4790"); err != nil {
+		fmt.Fprintf(os.Stderr, "setting %s: %v\n", ENV_WG_TUN_GRO_VXLAN_PORTS, err)
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
 
 // tnlFixture builds packets as they arrive off the wire: a TCP segment or UDP
 // datagram inside an Ethernet frame inside a VxLAN datagram.
@@ -115,14 +130,14 @@ func (f *tnlFixture) pkt(seq uint32, payload []byte, flags byte) []byte {
 	binary.BigEndian.PutUint16(b[udpAt+4:], uint16(total-udpAt))
 
 	// VxLAN header
-	vxlanAt := udpAt + udphLen
-	b[vxlanAt] = vxlanFlagI
-	b[vxlanAt+4] = byte(f.vni >> 16)
-	b[vxlanAt+5] = byte(f.vni >> 8)
-	b[vxlanAt+6] = byte(f.vni)
+	tunnelHdrAt := udpAt + udphLen
+	b[tunnelHdrAt] = vxlanFlagI
+	b[tunnelHdrAt+4] = byte(f.vni >> 16)
+	b[tunnelHdrAt+5] = byte(f.vni >> 8)
+	b[tunnelHdrAt+6] = byte(f.vni)
 
 	// encapsulated Ethernet header
-	ethAt := vxlanAt + vxlanLen
+	ethAt := tunnelHdrAt + vxlanLen
 	ethTypeAt := ethAt + 12
 	if f.innerV6 {
 		binary.BigEndian.PutUint16(b[ethTypeAt:], ethTypeIPv6)
@@ -226,7 +241,7 @@ func asReadByKernel(hdr []byte) []byte {
 		return out
 	}
 	if h.gsoType&virtioNetHdrGSOUDPTunnel != 0 {
-		h.outerThOffset -= tunTunnelOuterThBias
+		h.outerThOffset -= vxlanOuterThBias
 		if err := h.encode(out); err != nil {
 			return out
 		}
@@ -235,11 +250,11 @@ func asReadByKernel(hdr []byte) []byte {
 }
 
 // runTnlGRO hands pkts to handleGRO and returns the indices it chose to write.
-func runTnlGRO(t *testing.T, pkts [][]byte) ([][]byte, [][]byte, []int, *tunnelGROTable) {
+func runTnlGRO(t *testing.T, pkts [][]byte) ([][]byte, [][]byte, []int, *vxlanGROTable) {
 	t.Helper()
 	bufs, offset := tnlBufs(pkts)
 	hdrs := tnlHdrScratch(len(bufs))
-	table := newTunnelGROTable()
+	table := newVxlanGROTable()
 	var toWrite []int
 	err := handleGRO(bufs, offset, newTCPGROTable(), newUDPGROTable(), table, true, hdrs, &toWrite)
 	if err != nil {
@@ -248,10 +263,10 @@ func runTnlGRO(t *testing.T, pkts [][]byte) ([][]byte, [][]byte, []int, *tunnelG
 	return bufs, hdrs, toWrite, table
 }
 
-// Test_tunnelGRO_roundTrip is the oracle for the whole ingress path: packets
+// Test_vxlanGRO_roundTrip is the oracle for the whole ingress path: packets
 // coalesced by handleGRO are fed back through the split that mirrors the
 // kernel's, and must come out byte for byte as the packets that went in.
-func Test_tunnelGRO_roundTrip(t *testing.T) {
+func Test_vxlanGRO_roundTrip(t *testing.T) {
 	protos := []struct {
 		name  string
 		proto uint8
@@ -318,8 +333,8 @@ func Test_tunnelGRO_roundTrip(t *testing.T) {
 	}
 }
 
-// Test_tunnelGRO_header checks the header that describes a coalesced group.
-func Test_tunnelGRO_header(t *testing.T) {
+// Test_vxlanGRO_header checks the header that describes a coalesced group.
+func Test_vxlanGRO_header(t *testing.T) {
 	f := newTnlFixture(false, false)
 	var pkts [][]byte
 	for i := 0; i < 4; i++ {
@@ -333,9 +348,9 @@ func Test_tunnelGRO_header(t *testing.T) {
 	if err := hdr.decode(hdrs[toWrite[0]]); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	l, _, ok := parseTunnel(pkts[0])
+	l, _, ok := parseVxlan(pkts[0])
 	if !ok {
-		t.Fatal("parseTunnel rejected a packet it should accept")
+		t.Fatal("parseVxlan rejected a packet it should accept")
 	}
 	if hdr.gsoType != unix.VIRTIO_NET_HDR_GSO_TCPV4|virtioNetHdrGSOUDPTunnelIPv4 {
 		t.Errorf("gsoType = %#x, want %#x", hdr.gsoType, unix.VIRTIO_NET_HDR_GSO_TCPV4|virtioNetHdrGSOUDPTunnelIPv4)
@@ -354,8 +369,8 @@ func Test_tunnelGRO_header(t *testing.T) {
 	}
 	// The kernel validates outer_th_offset against an Ethernet header that
 	// IFF_TUN does not deliver, so we hand it a padded value.
-	if int(hdr.outerThOffset) != l.outerUdpAt+tunTunnelOuterThBias {
-		t.Errorf("outerThOffset = %d, want %d", hdr.outerThOffset, l.outerUdpAt+tunTunnelOuterThBias)
+	if int(hdr.outerThOffset) != l.outerUdpAt+vxlanOuterThBias {
+		t.Errorf("outerThOffset = %d, want %d", hdr.outerThOffset, l.outerUdpAt+vxlanOuterThBias)
 	}
 	if int(hdr.innerNhOffset) != l.innerIphAt {
 		t.Errorf("innerNhOffset = %d, want %d", hdr.innerNhOffset, l.innerIphAt)
@@ -383,10 +398,10 @@ func Test_tunnelGRO_header(t *testing.T) {
 	}
 }
 
-// Test_tunnelGRO_udpHeader checks the header that describes a coalesced group of
+// Test_vxlanGRO_udpHeader checks the header that describes a coalesced group of
 // encapsulated UDP datagrams, which differs from TCP's in the GSO type, in the
 // checksum offset, and in the inner length field it has to rewrite.
-func Test_tunnelGRO_udpHeader(t *testing.T) {
+func Test_vxlanGRO_udpHeader(t *testing.T) {
 	f := newTnlFixture(false, false)
 	f.proto = unix.IPPROTO_UDP
 	var pkts [][]byte
@@ -401,12 +416,12 @@ func Test_tunnelGRO_udpHeader(t *testing.T) {
 	if err := hdr.decode(hdrs[toWrite[0]]); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	l, _, ok := parseTunnel(pkts[0])
+	l, _, ok := parseVxlan(pkts[0])
 	if !ok {
-		t.Fatal("parseTunnel rejected a packet it should accept")
+		t.Fatal("parseVxlan rejected a packet it should accept")
 	}
 	if l.protocol != unix.IPPROTO_UDP {
-		t.Fatalf("parseTunnel protocol = %d, want UDP", l.protocol)
+		t.Fatalf("parseVxlan protocol = %d, want UDP", l.protocol)
 	}
 	// udp_gro_complete() marks the result GSO_UDP_L4 whatever the inner address
 	// family; the tunnel bit describes the outer one.
@@ -442,11 +457,11 @@ func Test_tunnelGRO_udpHeader(t *testing.T) {
 	}
 }
 
-// Test_tunnelGRO_udpUnchecked covers a datagram sent with a zero UDP checksum,
+// Test_vxlanGRO_udpUnchecked covers a datagram sent with a zero UDP checksum,
 // which udp_rcv() accepts unchecked. It still coalesces, and the emitted header
 // leaves the checksum zero rather than preloading a pseudo-header sum, the way
 // udp4_gro_complete() leaves an unchecked header alone.
-func Test_tunnelGRO_udpUnchecked(t *testing.T) {
+func Test_vxlanGRO_udpUnchecked(t *testing.T) {
 	f := newTnlFixture(false, false)
 	f.proto = unix.IPPROTO_UDP
 	f.innerZeroCSum = true
@@ -465,7 +480,7 @@ func Test_tunnelGRO_udpUnchecked(t *testing.T) {
 	if hdr.gsoType&virtioNetHdrGSOUDPTunnel == 0 {
 		t.Errorf("unchecked group was not described as tunnel GSO (gsoType %#x)", hdr.gsoType)
 	}
-	l, _, _ := parseTunnel(pkts[0])
+	l, _, _ := parseVxlan(pkts[0])
 	pkt := bufs[toWrite[0]][16:]
 	if got := binary.BigEndian.Uint16(pkt[l.transportAt+6:]); got != 0 {
 		t.Errorf("inner udp checksum = %#x, want 0: unchecked stays unchecked", got)
@@ -475,19 +490,19 @@ func Test_tunnelGRO_udpUnchecked(t *testing.T) {
 	}
 }
 
-// Test_tunnelGRO_udpBadChecksum covers the fallback: a datagram whose inner
+// Test_vxlanGRO_udpBadChecksum covers the fallback: a datagram whose inner
 // checksum does not validate is not one we can vouch for, so it is offered to
 // the plain UDP path rather than described as tunnel GSO and dropped from every
 // coalescing path.
-func Test_tunnelGRO_udpBadChecksum(t *testing.T) {
+func Test_vxlanGRO_udpBadChecksum(t *testing.T) {
 	f := newTnlFixture(false, false)
 	f.proto = unix.IPPROTO_UDP
 	var pkts [][]byte
 	for i := 0; i < 3; i++ {
 		p := f.pkt(0, bytes.Repeat([]byte{byte(i)}, 200), 0)
-		l, _, ok := parseTunnel(p)
+		l, _, ok := parseVxlan(p)
 		if !ok {
-			t.Fatal("parseTunnel rejected a packet it should accept")
+			t.Fatal("parseVxlan rejected a packet it should accept")
 		}
 		// Corrupt the inner checksum, then repair the encapsulating one, which
 		// covers the whole frame: only the inner validation may reject this.
@@ -512,15 +527,15 @@ func Test_tunnelGRO_udpBadChecksum(t *testing.T) {
 	if hdr.gsoType&virtioNetHdrGSOUDPTunnel != 0 {
 		t.Errorf("a group we cannot vouch for was described as tunnel GSO (gsoType %#x)", hdr.gsoType)
 	}
-	if got := table.stats.NotTunnel; got != 3 {
-		t.Errorf("NotTunnel = %d, want 3", got)
+	if got := table.stats.NotVxlan; got != 3 {
+		t.Errorf("NotVxlan = %d, want 3", got)
 	}
 }
 
-// Test_tunnelGRO_udpUnequalSizes covers the rule udp_gro_receive() applies to UDP
+// Test_vxlanGRO_udpUnequalSizes covers the rule udp_gro_receive() applies to UDP
 // and not to TCP: nothing may follow a short segment, and UDP has no sequence
 // number with which to prepend.
-func Test_tunnelGRO_udpUnequalSizes(t *testing.T) {
+func Test_vxlanGRO_udpUnequalSizes(t *testing.T) {
 	f := newTnlFixture(false, false)
 	f.proto = unix.IPPROTO_UDP
 	pkts := [][]byte{
@@ -537,10 +552,10 @@ func Test_tunnelGRO_udpUnequalSizes(t *testing.T) {
 	}
 }
 
-// Test_tunnelGRO_fallbacks covers the cases that must not be described as
+// Test_vxlanGRO_fallbacks covers the cases that must not be described as
 // tunnel GSO: either they fall back to plain UDP GRO, or they are understood as
 // tunnel packets that simply cannot share a group.
-func Test_tunnelGRO_fallbacks(t *testing.T) {
+func Test_vxlanGRO_fallbacks(t *testing.T) {
 	// resealOuterUDP repairs the encapsulating checksum after a mutation
 	// changed the bytes it covers, so that a fallback is attributed to the
 	// mutation and not to a checksum the test broke on the way.
@@ -557,7 +572,7 @@ func Test_tunnelGRO_fallbacks(t *testing.T) {
 	// resealInnerTCP repairs the encapsulated TCP checksum, which a mutation of
 	// the TCP header itself invalidates.
 	resealInnerTCP := func(p []byte) {
-		l, _, ok := parseTunnel(p)
+		l, _, ok := parseVxlan(p)
 		if !ok {
 			return
 		}
@@ -566,17 +581,17 @@ func Test_tunnelGRO_fallbacks(t *testing.T) {
 		binary.BigEndian.PutUint16(p[l.transportAt+16:], ^checksum(p[l.transportAt:], psum))
 	}
 	mutate := func(p []byte, what string) []byte {
-		l, _, ok := parseTunnel(p)
+		l, _, ok := parseVxlan(p)
 		if !ok {
 			t.Fatal("fixture does not parse")
 		}
 		switch what {
 		case "gpe":
-			p[l.vxlanAt] = vxlanFlagI | 0x04 // the GPE next-protocol bit
+			p[l.tunnelHdrAt] = vxlanFlagI | 0x04 // the GPE next-protocol bit
 		case "port":
 			binary.BigEndian.PutUint16(p[l.outerUdpAt+2:], 9999)
 		case "vni":
-			p[l.vxlanAt+4] = 0xff
+			p[l.tunnelHdrAt+4] = 0xff
 		case "inner-udp":
 			p[l.innerIphAt+9] = unix.IPPROTO_UDP
 		case "inner-frag":
@@ -651,9 +666,9 @@ func Test_tunnelGRO_fallbacks(t *testing.T) {
 	}
 }
 
-// Test_tunnelGRO_outOfOrder checks that segments that arrive out of order are
+// Test_vxlanGRO_outOfOrder checks that segments that arrive out of order are
 // still coalesced, which requires prepending to a group.
-func Test_tunnelGRO_outOfOrder(t *testing.T) {
+func Test_vxlanGRO_outOfOrder(t *testing.T) {
 	f := newTnlFixture(false, false)
 	var pkts [][]byte
 	for i := 0; i < 4; i++ {
@@ -686,15 +701,15 @@ func Test_tunnelGRO_outOfOrder(t *testing.T) {
 	}
 }
 
-// Test_tunnelGRO_stats checks that a fallback always says why.
-func Test_tunnelGRO_stats(t *testing.T) {
+// Test_vxlanGRO_stats checks that a fallback always says why.
+func Test_vxlanGRO_stats(t *testing.T) {
 	f := newTnlFixture(false, false)
 	bufs, offset := tnlBufs([][]byte{
 		f.pkt(1000, bytes.Repeat([]byte{1}, 100), tcpFlagACK),
 		f.pkt(1200, bytes.Repeat([]byte{2}, 100), tcpFlagACK), // a gap of 100 bytes
 	})
 	hdrs := tnlHdrScratch(len(bufs))
-	table := newTunnelGROTable()
+	table := newVxlanGROTable()
 	var toWrite []int
 	if err := handleGRO(bufs, offset, newTCPGROTable(), newUDPGROTable(), table, true, hdrs, &toWrite); err != nil {
 		t.Fatalf("handleGRO: %v", err)
@@ -714,9 +729,9 @@ func Test_tunnelGRO_stats(t *testing.T) {
 	}
 }
 
-// Test_tunnelGRO_tcpOptions checks that segments with TCP options coalesce, and
+// Test_vxlanGRO_tcpOptions checks that segments with TCP options coalesce, and
 // that a segment whose options differ does not.
-func Test_tunnelGRO_tcpOptions(t *testing.T) {
+func Test_vxlanGRO_tcpOptions(t *testing.T) {
 	f := newTnlFixture(false, false)
 	f.tcpOptions = 4
 	same := f.pkt(1100, bytes.Repeat([]byte{2}, 100), tcpFlagACK)
@@ -731,10 +746,10 @@ func Test_tunnelGRO_tcpOptions(t *testing.T) {
 	}
 }
 
-// Fuzz_tunnelGRO drives the ingress tunnel path with packets that start out
+// Fuzz_vxlanGRO drives the ingress tunnel path with packets that start out
 // well formed and are then mutated, so that the parser is reached at all, and
 // feeds whatever comes out back through the split, which must accept it.
-func Fuzz_tunnelGRO(f *testing.F) {
+func Fuzz_vxlanGRO(f *testing.F) {
 	fx := newTnlFixture(false, false)
 	seeds := make([][]byte, 4)
 	for i := range seeds {
@@ -778,7 +793,7 @@ func Fuzz_tunnelGRO(f *testing.F) {
 		bufs, offset := tnlBufs(pkts)
 		hdrs := tnlHdrScratch(len(bufs))
 		var toWrite []int
-		if err := handleGRO(bufs, offset, newTCPGROTable(), newUDPGROTable(), newTunnelGROTable(), true, hdrs, &toWrite); err != nil {
+		if err := handleGRO(bufs, offset, newTCPGROTable(), newUDPGROTable(), newVxlanGROTable(), true, hdrs, &toWrite); err != nil {
 			t.Fatalf("handleGRO: %v", err)
 		}
 		seen := make(map[int]bool)
@@ -813,10 +828,10 @@ func Fuzz_tunnelGRO(f *testing.F) {
 	})
 }
 
-// Test_tunnelGRO_pshPrepend checks that a segment arriving in front of a group
+// Test_vxlanGRO_pshPrepend checks that a segment arriving in front of a group
 // whose last segment has PSH does not silently drop the flag, because a prepend
 // replaces the header every segment is copied from.
-func Test_tunnelGRO_pshPrepend(t *testing.T) {
+func Test_vxlanGRO_pshPrepend(t *testing.T) {
 	f := newTnlFixture(false, false)
 	tail := f.pkt(1000, bytes.Repeat([]byte{1}, 100), tcpFlagACK)
 	head := f.pkt(1100, bytes.Repeat([]byte{2}, 100), tcpFlagACK|tcpFlagPSH)
@@ -830,7 +845,7 @@ func Test_tunnelGRO_pshPrepend(t *testing.T) {
 	}
 }
 
-// Test_tunnelGROTable_bounded asserts that the tunnel GRO table has a fixed
+// Test_vxlanGROTable_bounded asserts that the tunnel GRO table has a fixed
 // footprint: flow keys from one batch must never accumulate into the next, no
 // matter how many distinct inner flows arrive over the life of the device.
 //
@@ -838,7 +853,7 @@ func Test_tunnelGRO_pshPrepend(t *testing.T) {
 // and never seen again. That is the worst case the table can be given: it
 // forces newItems() to drain itemsPool completely, right down to its last
 // entry, on every single batch.
-func Test_tunnelGROTable_bounded(t *testing.T) {
+func Test_vxlanGROTable_bounded(t *testing.T) {
 	const batches = 200
 
 	// Packets are built through the fixture so that every checksum is correct
@@ -858,7 +873,7 @@ func Test_tunnelGROTable_bounded(t *testing.T) {
 	}
 
 	tcpTable, udpTable := newTCPGROTable(), newUDPGROTable()
-	table := newTunnelGROTable()
+	table := newVxlanGROTable()
 	if got := len(table.itemsPool); got != conn.IdealBatchSize {
 		t.Fatalf("itemsPool starts with %d entries, want %d", got, conn.IdealBatchSize)
 	}
@@ -885,7 +900,7 @@ func Test_tunnelGROTable_bounded(t *testing.T) {
 
 		table.reset()
 
-		// reset() must leave the table exactly as newTunnelGROTable built it.
+		// reset() must leave the table exactly as newVxlanGROTable built it.
 		if got := len(table.itemsByFlow); got != 0 {
 			t.Fatalf("batch %d: itemsByFlow holds %d keys after reset, want 0", b, got)
 		}
@@ -907,5 +922,78 @@ func Test_tunnelGROTable_bounded(t *testing.T) {
 	})
 	if allocs > 0 {
 		t.Errorf("a warm batch and reset allocate %v times; the table should be fixed size", allocs)
+	}
+}
+
+func Test_vxlanUDPPorts(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		set   bool
+		value string
+		want  []uint16
+	}{
+		{
+			// The path is opt-in: nothing is coalesced as VxLAN until the
+			// variable names a port.
+			name: "unset selects nothing",
+		},
+		{
+			// The way to turn the ingress path off, which leaves the egress
+			// tunnel offload alone.
+			name:  "set but empty selects nothing",
+			set:   true,
+			value: "",
+		},
+		{
+			name:  "a port list turns the path on",
+			set:   true,
+			value: "5000",
+			want:  []uint16{5000},
+		},
+		{
+			name:  "surrounding whitespace is tolerated",
+			set:   true,
+			value: " 4789 , 8472 ",
+			want:  []uint16{4789, 8472},
+		},
+		{
+			name:  "entries that are not a port are ignored",
+			set:   true,
+			value: "4789,http,0,99999,-1,,",
+			want:  []uint16{4789},
+		},
+		{
+			name:  "a wholly unusable value selects nothing",
+			set:   true,
+			value: "nope",
+		},
+		{
+			name:  "duplicates collapse",
+			set:   true,
+			value: "4789,4789",
+			want:  []uint16{4789},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// t.Setenv also restores the original, which is what keeps the
+			// unset case genuinely unset rather than empty.
+			t.Setenv(ENV_WG_TUN_GRO_VXLAN_PORTS, "sentinel")
+			if tc.set {
+				t.Setenv(ENV_WG_TUN_GRO_VXLAN_PORTS, tc.value)
+			} else {
+				if err := os.Unsetenv(ENV_WG_TUN_GRO_VXLAN_PORTS); err != nil {
+					t.Fatalf("unsetenv: %v", err)
+				}
+			}
+			got := parseVxlanUDPPorts()
+			if len(got) != len(tc.want) {
+				t.Fatalf("parsed %v, want %v", got, tc.want)
+			}
+			for _, port := range tc.want {
+				if !got[port] {
+					t.Errorf("port %d missing from %v", port, got)
+				}
+			}
+		})
 	}
 }

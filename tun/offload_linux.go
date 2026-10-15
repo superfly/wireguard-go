@@ -854,14 +854,7 @@ const (
 	vxlan6GROCandidate
 )
 
-// minTnlLen is the smallest packet that could hold an IPv4 tunnel header, a
-// VxLAN header, an Ethernet header, an IPv4 header and a transport header. The
-// smallest transport we accept is UDP's; a TCP header is bounded exactly by
-// transportHeaderLen. IPv6 outer headers are larger still, but this is only a
-// first filter: parseTunnel does the exact bounds checking.
-const minTnlLen = ipv4HeaderLen + udphLen + vxlanLen + ethHdrLen + ipv4HeaderLen + udphLen
-
-func packetIsGROCandidate(b []byte, canUDPGRO, canTunnelGRO bool) groCandidateType {
+func packetIsGROCandidate(b []byte, canUDPGRO, canVxlanGRO bool) groCandidateType {
 	if len(b) < 28 {
 		return notGROCandidate
 	}
@@ -874,7 +867,7 @@ func packetIsGROCandidate(b []byte, canUDPGRO, canTunnelGRO bool) groCandidateTy
 			return tcp4GROCandidate
 		}
 		if b[9] == unix.IPPROTO_UDP && canUDPGRO {
-			if canTunnelGRO && len(b) >= minTnlLen && isVxlanPort(binary.BigEndian.Uint16(b[ipv4HeaderLen+2:])) {
+			if canVxlanGRO && isVxlan4GROCandidate(b) {
 				return vxlan4GROCandidate
 			}
 			return udp4GROCandidate
@@ -884,7 +877,7 @@ func packetIsGROCandidate(b []byte, canUDPGRO, canTunnelGRO bool) groCandidateTy
 			return tcp6GROCandidate
 		}
 		if b[6] == unix.IPPROTO_UDP && len(b) >= 48 && canUDPGRO {
-			if canTunnelGRO && len(b) >= minTnlLen+ipv6HeaderLen-ipv4HeaderLen && isVxlanPort(binary.BigEndian.Uint16(b[ipv6HeaderLen+2:])) {
+			if canVxlanGRO && isVxlan6GROCandidate(b) {
 				return vxlan6GROCandidate
 			}
 			return udp6GROCandidate
@@ -897,7 +890,6 @@ const (
 	ipv4HeaderLen = 20
 	ipv6HeaderLen = 40
 	udphLen       = 8
-	vxlanLen      = 8 // the fixed part of a VxLAN or VxLAN-GPE header
 )
 
 // udpGRO evaluates the UDP packet at pktI in bufs for coalescing with
@@ -983,18 +975,18 @@ func udpGRO(bufs [][]byte, offset int, pktI int, table *udpGROTable, isV6 bool) 
 // packets into toWrite. toWrite, tcpTable, and udpTable should initially be
 // empty (but non-nil), and are passed in to save allocs as the caller may reset
 // and recycle them across vectors of packets. canUDPGRO indicates if UDP GRO is
-// supported. tnlTable is nil when the kernel will not accept a tunnel GSO
+// supported. vxlanTable is nil when the kernel will not accept a tunnel GSO
 // header, in which case encapsulated packets are coalesced as plain UDP. When
 // hdrs is non-nil it is a scratch area, one virtioNetHdrTnlLen sized slot per
 // buffer, that holds the headers instead of the space in front of each packet.
-func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGROTable, tnlTable *tunnelGROTable, canUDPGRO bool, hdrs [][]byte, toWrite *[]int) error {
+func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGROTable, vxlanTable *vxlanGROTable, canUDPGRO bool, hdrs [][]byte, toWrite *[]int) error {
 	store := &groHdrStore{bufs: bufs, offset: offset, scratch: hdrs}
 	for i := range bufs {
 		if offset < virtioNetHdrLen || offset > len(bufs[i])-1 {
 			return errors.New("invalid offset")
 		}
 		var result groResult
-		switch candidate := packetIsGROCandidate(bufs[i][offset:], canUDPGRO, tnlTable != nil); candidate {
+		switch candidate := packetIsGROCandidate(bufs[i][offset:], canUDPGRO, vxlanTable != nil); candidate {
 		case tcp4GROCandidate:
 			result = tcpGRO(bufs, offset, i, tcpTable, false)
 		case tcp6GROCandidate:
@@ -1004,7 +996,7 @@ func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGR
 		case udp6GROCandidate:
 			result = udpGRO(bufs, offset, i, udpTable, true)
 		case vxlan4GROCandidate, vxlan6GROCandidate:
-			result = tunnelGRO(bufs, offset, i, tnlTable)
+			result = vxlanGRO(bufs, offset, i, vxlanTable)
 			if result == groResultNoop {
 				// An encapsulated packet we cannot describe as tunnel GSO is still
 				// a plain UDP datagram, so fall back to coalescing it as one.
@@ -1022,7 +1014,7 @@ func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGR
 	}
 	errTCP := applyTCPCoalesceAccounting(bufs, offset, tcpTable, store)
 	errUDP := applyUDPCoalesceAccounting(bufs, offset, udpTable, store)
-	errTnl := applyTunnelCoalesceAccounting(bufs, offset, tnlTable, store)
+	errTnl := applyVxlanCoalesceAccounting(bufs, offset, vxlanTable, store)
 	return errors.Join(errTCP, errUDP, errTnl)
 }
 
@@ -1044,7 +1036,7 @@ type gsoLayout struct {
 	transportLen int  // length of that transport header
 	csumOffset   int  // offset of the checksum field within that header
 	protocol     uint8
-	vxlanAt      int // offset of the encapsulating tunnel header, or -1
+	tunnelHdrAt  int // offset of the encapsulating tunnel header, or -1
 	innerEthAt   int // offset of the encapsulated MAC header, or -1
 }
 
