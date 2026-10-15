@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"golang.org/x/sys/unix"
+
+	"golang.zx2c4.com/wireguard/conn"
 )
 
 // tnlFixture builds packets as they arrive off the wire: a TCP segment or UDP
@@ -825,5 +827,85 @@ func Test_tunnelGRO_pshPrepend(t *testing.T) {
 	head = f.pkt(1100, bytes.Repeat([]byte{2}, 100), tcpFlagACK)
 	if _, _, toWrite, _ := runTnlGRO(t, [][]byte{head, tail}); len(toWrite) != 1 {
 		t.Fatalf("prepend without PSH did not merge: %d writes", len(toWrite))
+	}
+}
+
+// Test_tunnelGROTable_bounded asserts that the tunnel GRO table has a fixed
+// footprint: flow keys from one batch must never accumulate into the next, no
+// matter how many distinct inner flows arrive over the life of the device.
+//
+// Each batch carries conn.IdealBatchSize packets from flows never seen before
+// and never seen again. That is the worst case the table can be given: it
+// forces newItems() to drain itemsPool completely, right down to its last
+// entry, on every single batch.
+func Test_tunnelGROTable_bounded(t *testing.T) {
+	const batches = 200
+
+	// Packets are built through the fixture so that every checksum is correct
+	// on the way in; a table handed rejected packets would look bounded for
+	// entirely the wrong reason.
+	build := func(batch int) ([][]byte, int, [][]byte) {
+		payload := bytes.Repeat([]byte{byte(batch)}, 100)
+		pkts := make([][]byte, conn.IdealBatchSize)
+		for i := range pkts {
+			f := newTnlFixture(false, false)
+			f.proto = unix.IPPROTO_UDP
+			f.innerSport = uint16(batch*conn.IdealBatchSize + i)
+			pkts[i] = f.pkt(0, payload, 0)
+		}
+		bufs, offset := tnlBufs(pkts)
+		return bufs, offset, tnlHdrScratch(len(bufs))
+	}
+
+	tcpTable, udpTable := newTCPGROTable(), newUDPGROTable()
+	table := newTunnelGROTable()
+	if got := len(table.itemsPool); got != conn.IdealBatchSize {
+		t.Fatalf("itemsPool starts with %d entries, want %d", got, conn.IdealBatchSize)
+	}
+
+	for b := 0; b < batches; b++ {
+		bufs, offset, hdrs := build(b)
+		var toWrite []int
+		if err := handleGRO(bufs, offset, tcpTable, udpTable, table, true, hdrs, &toWrite); err != nil {
+			t.Fatalf("batch %d: %v", b, err)
+		}
+		// Sanity: every packet really did form its own flow, and really was
+		// accepted rather than refused.
+		if got := len(table.itemsByFlow); got != conn.IdealBatchSize {
+			t.Fatalf("batch %d: itemsByFlow holds %d keys, want %d distinct flows", b, got, conn.IdealBatchSize)
+		}
+		if len(toWrite) != conn.IdealBatchSize {
+			t.Fatalf("batch %d: %d packets written, want all %d", b, len(toWrite), conn.IdealBatchSize)
+		}
+		// A full batch of distinct flows is the most the pool can ever be
+		// asked for, and it is sized to exactly that.
+		if got := len(table.itemsPool); got != 0 {
+			t.Fatalf("batch %d: itemsPool drained to %d entries, want 0", b, got)
+		}
+
+		table.reset()
+
+		// reset() must leave the table exactly as newTunnelGROTable built it.
+		if got := len(table.itemsByFlow); got != 0 {
+			t.Fatalf("batch %d: itemsByFlow holds %d keys after reset, want 0", b, got)
+		}
+		if got := len(table.itemsPool); got != conn.IdealBatchSize {
+			t.Fatalf("batch %d: itemsPool holds %d entries after reset, want %d", b, got, conn.IdealBatchSize)
+		}
+	}
+
+	// A warm batch allocates nothing: the pool is recycled, never refilled, so
+	// the table cannot grow however long the device runs.
+	bufs, offset, hdrs := build(batches)
+	var toWrite []int
+	allocs := testing.AllocsPerRun(50, func() {
+		if err := handleGRO(bufs, offset, tcpTable, udpTable, table, true, hdrs, &toWrite); err != nil {
+			t.Fatalf("steady state: %v", err)
+		}
+		table.reset()
+		toWrite = toWrite[:0]
+	})
+	if allocs > 0 {
+		t.Errorf("a warm batch and reset allocate %v times; the table should be fixed size", allocs)
 	}
 }

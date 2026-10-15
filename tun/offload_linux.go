@@ -1084,9 +1084,7 @@ func ipSegmentAddrs(b []byte, iphAt int, isV6 bool) (src, dst []byte) {
 
 // setIPLen updates the length, identification, and checksum fields of the IP
 // header of length iphLen at iphAt in b, which describes the i'th segment of a
-// GSO packet whose total length is totalLen. The header checksum field of IPv4
-// headers must have been cleared beforehand, in the template every segment is
-// copied from.
+// GSO packet whose total length is totalLen.
 func setIPLen(b []byte, iphAt, iphLen, totalLen, i int, isV6 bool) {
 	if isV6 {
 		// For IPv6 we are responsible for updating the payload length field.
@@ -1101,6 +1099,9 @@ func setIPLen(b []byte, iphAt, iphLen, totalLen, i int, isV6 bool) {
 		binary.BigEndian.PutUint16(b[iphAt+4:], id)
 	}
 	binary.BigEndian.PutUint16(b[iphAt+2:], uint16(totalLen))
+	// The checksum runs over the header itself, so its own field has to read as
+	// zero first. Clearing it here leaves nothing for callers to set up.
+	b[iphAt+10], b[iphAt+11] = 0, 0
 	ipv4CSum := ^checksum(b[iphAt:iphAt+iphLen], 0)
 	binary.BigEndian.PutUint16(b[iphAt+10:], ipv4CSum)
 }
@@ -1131,12 +1132,8 @@ func gsoSplit(in []byte, hdr virtioNetHdr, l gsoLayout, outBuffs [][]byte, sizes
 
 	// Clear the checksums that every segment gets its own copy of, so that the
 	// headers copied from the template below do not carry stale values over.
-	if !l.outerIsV6 {
-		in[l.outerIphAt+10], in[l.outerIphAt+11] = 0, 0 // clear ipv4 header checksum
-	}
-	if l.innerIphAt != l.outerIphAt && !l.innerIsV6 {
-		in[l.innerIphAt+10], in[l.innerIphAt+11] = 0, 0 // clear inner ipv4 header checksum
-	}
+	// The IPv4 header checksums are not among them: setIPLen clears and
+	// recomputes each one as it rewrites the length.
 	transportCsumAt := l.transportAt + l.csumOffset
 	in[transportCsumAt], in[transportCsumAt+1] = 0, 0 // clear tcp/udp checksum
 	if l.outerUdpAt >= 0 && l.outerCSum {

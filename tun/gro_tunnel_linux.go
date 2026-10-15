@@ -4,6 +4,7 @@ package tun
 
 import (
 	"encoding/binary"
+	"fmt"
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
@@ -133,17 +134,19 @@ func parseTunnel(b []byte) (gsoLayout, uint32, bool) {
 		innerProto = b[l.innerIphAt+9]
 		l.innerIphLen = ipv4HeaderLen
 	}
-	if innerProto != unix.IPPROTO_TCP && innerProto != unix.IPPROTO_UDP {
-		return l, 0, false
-	}
 	l.protocol = innerProto
-	// Both transports keep their checksum where the kernel's csum_offset
-	// expects it: tcp_gro_complete() and udp_gro_complete() both point
-	// csum_start at the transport header, at offsetof(udphdr, check) for UDP
-	// and offsetof(tcphdr, check) for TCP.
-	l.csumOffset = 16
-	if innerProto == unix.IPPROTO_UDP {
+	// Each transport keeps its checksum where the kernel's csum_offset expects
+	// it: tcp_gro_complete() and udp_gro_complete() both point csum_start at the
+	// transport header, at offsetof(tcphdr, check) for TCP and
+	// offsetof(udphdr, check) for UDP. Anything else inside a tunnel is not
+	// something we can describe as tunnel GSO.
+	switch innerProto {
+	case unix.IPPROTO_TCP:
+		l.csumOffset = 16
+	case unix.IPPROTO_UDP:
 		l.csumOffset = 6
+	default:
+		return l, 0, false
 	}
 	l.transportAt = l.innerIphAt + l.innerIphLen
 	transportLen, err := transportHeaderLen(b, l.transportAt, l.protocol)
@@ -404,10 +407,10 @@ func coalesceTunnelPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoS
 		return coalesceInsufficientCap
 	}
 	// The inner transport checksum of every segment has to be valid, since the
-	// kernel hands the coalesced inner packet to the socket as one unit. UDP was
-	// already validated in tunnelGRO, which is where it can be tested without
-	// first paying for a merge attempt.
-	if l.protocol != unix.IPPROTO_UDP {
+	// kernel hands the coalesced inner packet to the socket as one unit. TCP is
+	// checked here, where a merge is about to be paid for; UDP was already
+	// validated in tunnelGRO, which is where it can be tested for free.
+	if l.protocol == unix.IPPROTO_TCP {
 		if item.numMerged == 0 {
 			if !innerChecksumIsValid(bufs[item.bufsIndex][offset:], item.l) {
 				return coalesceItemInvalidCSum
@@ -563,20 +566,28 @@ func applyTunnelCoalesceAccounting(bufs [][]byte, offset int, table *tunnelGROTa
 			}
 			pkt := bufs[item.bufsIndex][offset:]
 			l := item.l
+			// The tunnel bit describes the outer address family; the gso type
+			// describes the inner transport.
 			tunnelType := uint8(virtioNetHdrGSOUDPTunnelIPv4)
-			gsoType := uint8(unix.VIRTIO_NET_HDR_GSO_TCPV4)
-			if l.innerIsV6 {
-				gsoType = unix.VIRTIO_NET_HDR_GSO_TCPV6
-			}
-			if l.protocol == unix.IPPROTO_UDP {
-				// udp_gro_complete() marks the result GSO_UDP_L4 whatever
-				// the inner address family, and virtio_net_hdr_tnl_to_skb()
-				// then reads the inner version from inner_nh_offset rather
-				// than from the gso type, since for USO the type cannot say.
-				gsoType = unix.VIRTIO_NET_HDR_GSO_UDP_L4
-			}
 			if l.outerIsV6 {
 				tunnelType = virtioNetHdrGSOUDPTunnelIPv6
+			}
+			var gsoType uint8
+			switch l.protocol {
+			case unix.IPPROTO_UDP:
+				// udp_gro_complete() marks the result GSO_UDP_L4 whatever the
+				// inner address family, and virtio_net_hdr_tnl_to_skb() then
+				// reads the inner version from inner_nh_offset rather than from
+				// the gso type, since for USO the type cannot say.
+				gsoType = unix.VIRTIO_NET_HDR_GSO_UDP_L4
+			case unix.IPPROTO_TCP:
+				if l.innerIsV6 {
+					gsoType = unix.VIRTIO_NET_HDR_GSO_TCPV6
+				} else {
+					gsoType = unix.VIRTIO_NET_HDR_GSO_TCPV4
+				}
+			default:
+				return fmt.Errorf("tunnel GRO: unexpected inner protocol %d", l.protocol)
 			}
 			hdr := virtioNetHdrTnl{
 				virtioNetHdr: virtioNetHdr{
@@ -593,17 +604,11 @@ func applyTunnelCoalesceAccounting(bufs [][]byte, offset int, table *tunnelGROTa
 			}
 			// The outer and inner IP headers both describe the whole coalesced
 			// packet now, and the encapsulating UDP header covers all of it.
-			if !l.outerIsV6 {
-				pkt[l.outerIphAt+10], pkt[l.outerIphAt+11] = 0, 0
-			}
 			setIPLen(pkt, l.outerIphAt, l.outerIphLen, len(pkt), 0, l.outerIsV6)
 			binary.BigEndian.PutUint16(pkt[l.outerUdpAt+4:], uint16(len(pkt)-l.outerUdpAt))
 			// The kernel computes a checksum for each encapsulating datagram it
 			// emits, so the template's own value is not carried over.
 			pkt[l.outerUdpAt+6], pkt[l.outerUdpAt+7] = 0, 0
-			if !l.innerIsV6 {
-				pkt[l.innerIphAt+10], pkt[l.innerIphAt+11] = 0, 0
-			}
 			setIPLen(pkt, l.innerIphAt, l.innerIphLen, len(pkt)-l.innerIphAt, 0, l.innerIsV6)
 			if l.protocol == unix.IPPROTO_UDP {
 				// udp4_gro_complete() does udp_set_len(uh, skb->len - nhoff),
@@ -613,12 +618,6 @@ func applyTunnelCoalesceAccounting(bufs [][]byte, offset int, table *tunnelGROTa
 			}
 			// The inner transport checksum becomes a partial checksum over the
 			// whole coalesced group, which the kernel completes per segment.
-			srcAddrAt := offset + l.innerIphAt + ipv4SrcAddrOffset
-			addrLen := 4
-			if l.innerIsV6 {
-				srcAddrAt = offset + l.innerIphAt + ipv6SrcAddrOffset
-				addrLen = 16
-			}
 			// udp4_gro_complete() preloads ~udp_v4_check() only when the header
 			// carried a checksum; an unchecked one stays zero and the kernel
 			// completes a full checksum per segment from the partial offset.
@@ -629,8 +628,7 @@ func applyTunnelCoalesceAccounting(bufs [][]byte, offset int, table *tunnelGROTa
 			if unchecked {
 				binary.BigEndian.PutUint16(pkt[l.transportAt+l.csumOffset:], 0)
 			} else {
-				srcAddr := bufs[item.bufsIndex][srcAddrAt : srcAddrAt+addrLen]
-				dstAddr := bufs[item.bufsIndex][srcAddrAt+addrLen : srcAddrAt+addrLen*2]
+				srcAddr, dstAddr := ipSegmentAddrs(pkt, l.innerIphAt, l.innerIsV6)
 				psum := pseudoHeaderChecksumNoFold(l.protocol, srcAddr, dstAddr, uint16(len(pkt)-l.innerIphAt-l.innerIphLen))
 				binary.BigEndian.PutUint16(pkt[l.transportAt+l.csumOffset:], checksum([]byte{}, psum))
 			}
